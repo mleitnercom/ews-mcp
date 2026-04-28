@@ -1,7 +1,7 @@
 """Tests for contact tools."""
 
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.tools.contact_tools import (
     CreateContactTool,
@@ -45,3 +45,41 @@ async def test_find_person_no_results(mock_ews_client):
     result = await tool.execute(query="nonexistent", source="gal")
 
     assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_contact_tool_sets_categories(mock_ews_client):
+    """Create contact should persist provided categories."""
+    tool = CreateContactTool(mock_ews_client)
+
+    with patch('src.tools.contact_tools.Contact') as mock_contact_cls:
+        mock_contact = MagicMock()
+        mock_contact.id = "contact-1"
+        mock_contact_cls.return_value = mock_contact
+
+        result = await tool.execute(
+            given_name="Michael",
+            surname="Leitner",
+            email_address="michael@example.com",
+            categories=["VIP", "Blocker"]
+        )
+
+    assert result["success"] is True
+    assert mock_contact.categories == ["VIP", "Blocker"]
+
+
+@pytest.mark.asyncio
+async def test_update_contact_tool_sets_categories(mock_ews_client):
+    """Update contact should replace categories when provided."""
+    tool = UpdateContactTool(mock_ews_client)
+
+    mock_contact = MagicMock()
+    mock_ews_client.account.contacts.get.return_value = mock_contact
+
+    result = await tool.execute(
+        item_id="contact-1",
+        categories=["VIP", "Blocker"]
+    )
+
+    assert result["success"] is True
+    assert mock_contact.categories == ["VIP", "Blocker"]

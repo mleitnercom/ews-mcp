@@ -35,6 +35,23 @@ async def test_create_task_tool(mock_ews_client):
 
 
 @pytest.mark.asyncio
+async def test_create_task_tool_sets_categories(mock_ews_client):
+    """Create task should persist provided categories."""
+    tool = CreateTaskTool(mock_ews_client)
+
+    mock_task = MagicMock()
+    mock_task.id = "task-123"
+
+    with patch('src.tools.task_tools.Task', return_value=mock_task):
+        await tool.execute(
+            subject="Test Task",
+            categories=["Waiting", "Critical"]
+        )
+
+    assert mock_task.categories == ["Waiting", "Critical"]
+
+
+@pytest.mark.asyncio
 async def test_get_tasks_tool(mock_ews_client):
     """Test getting tasks."""
     tool = GetTasksTool(mock_ews_client)
@@ -75,6 +92,24 @@ async def test_update_task_tool(mock_ews_client):
 
     assert result["success"] is True
     mock_task.save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_update_task_tool_sets_categories(mock_ews_client):
+    """Update task should replace categories when provided."""
+    tool = UpdateTaskTool(mock_ews_client)
+
+    mock_task = MagicMock()
+    mock_task.id = "task-1"
+    mock_ews_client.account.tasks.get.return_value = mock_task
+
+    result = await tool.execute(
+        item_id="task-1",
+        categories=["Waiting", "Critical"]
+    )
+
+    assert result["success"] is True
+    assert mock_task.categories == ["Waiting", "Critical"]
 
 
 @pytest.mark.asyncio

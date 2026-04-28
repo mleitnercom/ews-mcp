@@ -32,6 +32,21 @@ async def test_create_appointment_tool(mock_ews_client, sample_appointment):
 
 
 @pytest.mark.asyncio
+async def test_create_appointment_tool_sets_categories(mock_ews_client, sample_appointment):
+    """Create appointment should persist provided categories."""
+    tool = CreateAppointmentTool(mock_ews_client)
+
+    with patch('src.tools.calendar_tools.CalendarItem') as mock_calendar:
+        mock_item = MagicMock()
+        mock_item.id = "appointment-id"
+        mock_calendar.return_value = mock_item
+
+        await tool.execute(**sample_appointment, categories=["Blocker", "Critical"])
+
+        assert mock_item.categories == ["Blocker", "Critical"]
+
+
+@pytest.mark.asyncio
 async def test_get_calendar_tool(mock_ews_client):
     """Test getting calendar events."""
     tool = GetCalendarTool(mock_ews_client)
@@ -82,6 +97,23 @@ async def test_update_appointment_tool(mock_ews_client):
     assert result["success"] is True
     assert mock_appointment.subject == "Updated Meeting"
     mock_appointment.save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_update_appointment_tool_sets_categories(mock_ews_client):
+    """Update appointment should replace categories when provided."""
+    tool = UpdateAppointmentTool(mock_ews_client)
+
+    mock_appointment = MagicMock()
+    mock_ews_client.account.calendar.get.return_value = mock_appointment
+
+    result = await tool.execute(
+        item_id="test-id",
+        categories=["Blocker", "Critical"]
+    )
+
+    assert result["success"] is True
+    assert mock_appointment.categories == ["Blocker", "Critical"]
 
 
 @pytest.mark.asyncio

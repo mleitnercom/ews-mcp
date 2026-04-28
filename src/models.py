@@ -64,6 +64,7 @@ class SendEmailRequest(BaseModel):
     importance: ImportanceLevel = ImportanceLevel.NORMAL
     sensitivity: SensitivityLevel = SensitivityLevel.NORMAL
     attachments: Optional[List[str]] = Field(None, description="Attachment file paths")
+    categories: Optional[List[str]] = Field(None, description="Outlook categories")
 
     @field_validator("attachments")
     @classmethod
@@ -135,6 +136,7 @@ class CreateAppointmentRequest(BaseModel):
     attendees: Optional[List[EmailStr]] = Field(None, description="Attendee email addresses")
     is_all_day: bool = Field(default=False, description="All day event")
     reminder_minutes: Optional[int] = Field(15, description="Reminder minutes before")
+    categories: Optional[List[str]] = Field(None, description="Outlook categories")
 
     @field_validator("end_time")
     @classmethod
@@ -185,6 +187,7 @@ class CreateContactRequest(BaseModel):
     company: Optional[str] = Field(None, description="Company name")
     job_title: Optional[str] = Field(None, description="Job title")
     department: Optional[str] = Field(None, description="Department")
+    categories: Optional[List[str]] = Field(None, description="Outlook categories")
 
     @field_validator("email_address")
     @classmethod
@@ -214,6 +217,7 @@ class CreateTaskRequest(BaseModel):
     start_date: Optional[datetime] = Field(None, description="Start date")
     importance: ImportanceLevel = ImportanceLevel.NORMAL
     reminder_time: Optional[datetime] = Field(None, description="Reminder time")
+    categories: Optional[List[str]] = Field(None, description="Outlook categories")
 
 
 class TaskDetails(BaseModel):

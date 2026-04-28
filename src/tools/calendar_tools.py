@@ -160,6 +160,11 @@ class CreateAppointmentTool(BaseTool):
                         "description": "Reminder minutes before (optional)",
                         "default": 15
                     },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Outlook categories (optional)"
+                    },
                     **INLINE_ATTACHMENTS_SCHEMA,
                     "target_mailbox": {
                         "type": "string",
@@ -204,6 +209,9 @@ class CreateAppointmentTool(BaseTool):
             if request.reminder_minutes is not None:
                 item.reminder_is_set = True
                 item.reminder_minutes_before_start = request.reminder_minutes
+
+            if request.categories is not None:
+                item.categories = request.categories
 
             # Add attendees
             if request.attendees:
@@ -395,6 +403,11 @@ class UpdateAppointmentTool(BaseTool):
                         "type": "string",
                         "description": "New body (optional)"
                     },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Replace Outlook categories with this list (optional)"
+                    },
                     **INLINE_ATTACHMENTS_SCHEMA,
                     "target_mailbox": {
                         "type": "string",
@@ -432,6 +445,9 @@ class UpdateAppointmentTool(BaseTool):
 
             if "body" in kwargs:
                 item.body = kwargs["body"]
+
+            if "categories" in kwargs:
+                item.categories = kwargs["categories"]
 
             # Add inline (base64) attachments if provided
             inline_count = attach_inline_files(item, kwargs.get("inline_attachments", []))

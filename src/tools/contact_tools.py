@@ -60,6 +60,11 @@ class CreateContactTool(BaseTool):
                         "type": "string",
                         "description": "Department (optional)"
                     },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Outlook categories (optional)"
+                    },
                     "target_mailbox": {
                         "type": "string",
                         "description": "Email address to operate on (requires impersonation/delegate access)"
@@ -137,6 +142,9 @@ class CreateContactTool(BaseTool):
             if request.department:
                 contact.department = request.department
 
+            if request.categories is not None:
+                contact.categories = request.categories
+
             # Save contact
             contact.save()
 
@@ -193,6 +201,11 @@ class UpdateContactTool(BaseTool):
                         "type": "string",
                         "description": "New job title (optional)"
                     },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Replace Outlook categories with this list (optional)"
+                    },
                     "target_mailbox": {
                         "type": "string",
                         "description": "Email address to operate on (requires impersonation/delegate access)"
@@ -235,6 +248,9 @@ class UpdateContactTool(BaseTool):
 
             if "job_title" in kwargs:
                 contact.job_title = kwargs["job_title"]
+
+            if "categories" in kwargs:
+                contact.categories = kwargs["categories"]
 
             # Save changes
             contact.save()

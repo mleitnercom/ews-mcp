@@ -47,6 +47,11 @@ class CreateTaskTool(BaseTool):
                         "type": "string",
                         "description": "Reminder time (ISO 8601 format, optional)"
                     },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Outlook categories (optional)"
+                    },
                     "target_mailbox": {
                         "type": "string",
                         "description": "Email address to operate on (requires impersonation/delegate access)"
@@ -90,6 +95,9 @@ class CreateTaskTool(BaseTool):
             if request.reminder_time:
                 task.reminder_is_set = True
                 task.reminder_due_by = parse_datetime_tz_aware(request.reminder_time.isoformat())
+
+            if request.categories is not None:
+                task.categories = request.categories
 
             # Save task
             task.save()
@@ -259,6 +267,11 @@ class UpdateTaskTool(BaseTool):
                         "enum": ["Low", "Normal", "High"],
                         "description": "New importance (optional)"
                     },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Replace Outlook categories with this list (optional)"
+                    },
                     "target_mailbox": {
                         "type": "string",
                         "description": "Email address to operate on (requires impersonation/delegate access)"
@@ -301,6 +314,9 @@ class UpdateTaskTool(BaseTool):
 
             if "importance" in kwargs:
                 task.importance = kwargs["importance"]
+
+            if "categories" in kwargs:
+                task.categories = kwargs["categories"]
 
             # Save changes
             task.save()

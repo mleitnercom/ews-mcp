@@ -66,6 +66,11 @@ class CreateDraftTool(BaseTool):
                         "enum": ["Low", "Normal", "High"],
                         "description": "Email importance level (optional)"
                     },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Outlook categories (optional)"
+                    },
                     "attachments": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -127,6 +132,9 @@ class CreateDraftTool(BaseTool):
 
             # Set importance
             message.importance = request.importance.value
+
+            if request.categories is not None:
+                message.categories = request.categories
 
             # Add file attachments
             attachment_count = 0
@@ -194,6 +202,11 @@ class CreateReplyDraftTool(BaseTool):
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "File paths to attach to the draft reply (optional)"
+                    },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Outlook categories (optional)"
                     },
                     **INLINE_ATTACHMENTS_SCHEMA,
                     "target_mailbox": {
@@ -291,6 +304,9 @@ class CreateReplyDraftTool(BaseTool):
                 folder=account.drafts,
             )
 
+            if "categories" in kwargs:
+                message.categories = kwargs["categories"]
+
             inline_count, _ = copy_attachments_to_message(original_message, message)
             attachment_count = 0
 
@@ -377,6 +393,11 @@ class CreateForwardDraftTool(BaseTool):
                         "items": {"type": "string"},
                         "description": "Additional file paths to attach to the draft (optional)"
                     },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Outlook categories (optional)"
+                    },
                     **INLINE_ATTACHMENTS_SCHEMA,
                     "target_mailbox": {
                         "type": "string",
@@ -448,6 +469,9 @@ class CreateForwardDraftTool(BaseTool):
                 to_recipients=[Mailbox(email_address=email) for email in to_recipients],
                 folder=account.drafts,
             )
+
+            if "categories" in kwargs:
+                message.categories = kwargs["categories"]
 
             if cc_recipients:
                 message.cc_recipients = [Mailbox(email_address=email) for email in cc_recipients]
