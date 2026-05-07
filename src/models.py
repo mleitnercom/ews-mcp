@@ -155,6 +155,7 @@ class AppointmentDetails(BaseModel):
     location: Optional[str] = None
     organizer: str
     attendees: List[str]
+    categories: List[str] = Field(default_factory=list)
     body: Optional[str] = None
     is_all_day: bool
     response_status: Optional[str] = None
