@@ -231,6 +231,27 @@ Claude Desktop launches the container per session, talks to it over
 stdin/stdout. No network port exposed; no auth headache. Best for a
 single user on the same machine.
 
+#### Windows / Claude Desktop (MSIX) note
+
+Some Windows Store / MSIX builds of Claude Desktop do not reliably honor
+the configured `cwd` for local Python servers. If `python -m src.main`
+fails with `ModuleNotFoundError: No module named 'src'`, use the wrapper
+script in the repository root instead:
+
+```json
+{
+  "mcpServers": {
+    "ews": {
+      "command": "python",
+      "args": ["C:\\absolute\\path\\to\\ews-mcp\\run_server.py"]
+    }
+  }
+}
+```
+
+`run_server.py` resolves the repository root from its own location and
+optionally honors `EWS_MCP_ROOT` if you need to override the path.
+
 #### C. Remote SSE via `mcp-remote` (header-based auth, JSON config)
 
 For users on older Claude Desktop versions or who need custom headers:
