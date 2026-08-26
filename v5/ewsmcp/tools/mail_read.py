@@ -934,7 +934,11 @@ TOOLS: List[ToolSpec] = [
             "m12; raw EWS ids also work). format='full' (default) returns "
             "recipients, the cleaned body (quoted history stripped — use "
             "get_thread for the conversation) and the attachment inventory; "
-            "format='concise' returns the compact card. A not_found means the "
+            "format='concise' returns the compact card. A cache-served read "
+            "carries only attachments_hint, not the inventory — pass "
+            "fresh=true to get it. A draft you just created is never in the "
+            "mirror yet, so verifying an attach ALWAYS needs fresh=true. "
+            "A not_found means the "
             "id went stale (items move) — re-run search_messages and retry "
             "with a fresh id."
         ),

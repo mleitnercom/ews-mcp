@@ -15,6 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from exchangelib.items.base import BulkCreateResult
+
 from ewsmcp.tools import writes
 
 from test_writes import FakeDraftMessage, call, make_account, make_ctx
@@ -66,7 +68,11 @@ def test_create_draft_without_attachments_is_unchanged(tmp_path, monkeypatch):
     assert "attachments" not in res["preview"]
 
 
-def test_create_draft_forward_attaches_to_the_saved_reply(tmp_path):
+def test_create_draft_forward_attaches_to_the_refetched_item(tmp_path):
+    """save() on a reply/forward hands back a BulkCreateResult — ids only, no
+    Item API. Attaching to it raised AttributeError and still left the draft
+    behind. The REAL exchangelib class is used here so this cannot drift back
+    into a MagicMock that accepts .attach() happily."""
     account = make_account()
     ctx, root = _ctx(tmp_path, account)
     original = MagicMock()
@@ -74,21 +80,59 @@ def test_create_draft_forward_attaches_to_the_saved_reply(tmp_path):
     fwd = MagicMock()
     fwd.to_recipients = [SimpleNamespace(email_address="m.h@corp.example")]
     fwd.cc_recipients = None
-    saved = MagicMock()
-    saved.id, saved.changekey = "RAW-FWD", "CK-FWD"
-    fwd.save.return_value = saved
+    fwd.save.return_value = BulkCreateResult(id="RAW-FWD", changekey="CK-FWD")
     original.create_forward.return_value = fwd
     account._by_id["RAW-ORIG"] = original
-    alias = ctx.aliaser.alias_for("RAW-ORIG", "m")
-    path = _file(root, "beleg.pdf")
 
+    # the real draft, as account.fetch() would return it
+    real_draft = MagicMock()
+    real_draft.id, real_draft.changekey = "RAW-FWD", "CK-ATT"
+    account._by_id["RAW-FWD"] = real_draft
+
+    alias = ctx.aliaser.alias_for("RAW-ORIG", "m")
     res = call(ctx, "create_draft",
                {"mode": "forward", "reply_to": alias, "to": ["m.h@corp.example"],
-                "body": "anbei", "attachments": [path]})
+                "body": "anbei", "attachments": [_file(root, "beleg.pdf")]})
 
+    assert res["ok"] is True, res
+    assert real_draft.attach.call_count == 1        # the re-fetched Item …
+    assert res["preview"]["attachments"] == [
+        {"name": "beleg.pdf", "size_bytes": 7}]
+
+
+def test_reply_without_attachments_does_not_refetch(tmp_path):
+    """No attachments → no extra round trip; the old fast path is unchanged."""
+    account = make_account()
+    ctx, _ = _ctx(tmp_path, account)
+    original = MagicMock()
+    original.subject = "Budget"
+    reply = MagicMock()
+    reply.to_recipients = [SimpleNamespace(email_address="boss@corp.example")]
+    reply.cc_recipients = None
+    reply.save.return_value = BulkCreateResult(id="RAW-REPLY", changekey="CK")
+    original.create_reply.return_value = reply
+    account._by_id["RAW-ORIG"] = original
+    alias = ctx.aliaser.alias_for("RAW-ORIG", "m")
+
+    res = call(ctx, "create_draft",
+               {"mode": "reply", "reply_to": alias, "body": "Danke"})
     assert res["ok"] is True
-    assert saved.attach.call_count == 1     # the SAVED item, not the template
-    assert fwd.attach.call_count == 0
+    assert ctx.aliaser.resolve(res["draft_id"]) == "RAW-REPLY"
+
+
+def test_failed_attach_discards_the_draft(tmp_path, monkeypatch):
+    """A call that reports an error must leave no orphan draft behind."""
+    account = make_account()
+    ctx, root = _ctx(tmp_path, account)
+    monkeypatch.setattr(writes, "Message", FakeDraftMessage)
+    boom = FakeDraftMessage
+    monkeypatch.setattr(boom, "attach",
+                        lambda self, a: (_ for _ in ()).throw(RuntimeError("EWS said no")))
+    res = call(ctx, "create_draft",
+               {"to": ["a@x.com"], "body": "x",
+                "attachments": [_file(root, "x.txt")]})
+    assert res["ok"] is False
+    assert FakeDraftMessage.last.trashed is True    # moved to trash, not left
 
 
 # --- update_draft ------------------------------------------------------------

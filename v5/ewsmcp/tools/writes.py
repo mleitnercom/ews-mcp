@@ -28,6 +28,10 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
 - ``Item.move(folder)`` returns ``None`` and updates ``item.id`` in place.
 - There is NO follow-up-flag parameter anywhere: 5.0.3 has no first-class
   flag field; pretending would be mock-drift bait (categories instead).
+- ``BaseReplyItem.save(folder)`` (reply/reply_all/forward) returns a
+  ``BulkCreateResult``, NOT a ``Message``: ids and an attachment list, none
+  of the Item API. Attaching to it raises AttributeError, so that path
+  re-fetches the draft by id first (``_saved_draft_item``).
 - ``Item.attach(att)`` on a SAVED item issues CreateAttachment immediately
   and writes the new root changekey back onto the parent in place. On an
   unsaved item it only appends locally — hence attachments are always
@@ -201,14 +205,43 @@ def _load_attachments(settings: Any, paths: List[str]) -> List[FileAttachment]:
     return out
 
 
-def _attach_all(msg: Any, atts: List[FileAttachment]) -> List[Dict[str, Any]]:
-    """Attach to an ALREADY SAVED item — each attach() is one CreateAttachment
-    round trip that rolls the parent changekey forward in place."""
+def _attach_all(account: Any, msg: Any, atts: List[FileAttachment]) -> List[Dict[str, Any]]:
+    """Attach to an ALREADY SAVED draft — each attach() is one CreateAttachment
+    round trip that rolls the parent changekey forward in place.
+
+    ``msg`` MUST be a real ``Item``. The reply/forward path cannot pass the
+    result of ``BaseReplyItem.save()`` here: that returns a
+    ``BulkCreateResult``, a BaseItem carrying ids only, with no ``attach()``
+    — see ``_saved_draft_item``.
+
+    On failure the half-built draft is moved to trash: a call that reports an
+    error must not leave an orphan behind for an unattended run to accumulate.
+    """
     applied: List[Dict[str, Any]] = []
-    for att in atts:
-        msg.attach(att)
-        applied.append({"name": att.name, "size_bytes": len(att.content or b"")})
+    try:
+        for att in atts:
+            msg.attach(att)
+            applied.append({"name": att.name, "size_bytes": len(att.content or b"")})
+    except Exception:
+        try:
+            msg.move_to_trash()  # reversible — never HardDelete on an error path
+        except Exception:
+            logger.warning("could not discard the draft after a failed attach",
+                           exc_info=True)
+        raise
     return applied
+
+
+def _saved_draft_item(account: Any, saved: Any) -> Any:
+    """Re-fetch a reply/forward draft as a real Item.
+
+    ``Message.create_reply(...).save(folder)`` returns a ``BulkCreateResult``
+    ("a dummy class to store return values"), not a ``Message``. It carries
+    id/changekey/attachments but none of the Item API, so attaching to it
+    raises AttributeError. Fetching by id yields the genuine item that
+    ``update_draft`` already attaches to successfully.
+    """
+    return _fetch_one(account, str(getattr(saved, "id", saved)))
 
 
 def _fetch_one(account: Any, raw_id: str) -> Any:
@@ -306,7 +339,7 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
             if importance == "high":
                 msg.importance = "High"
             msg.save()  # SAVE_ONLY into Drafts — nothing leaves the mailbox
-            applied = _attach_all(msg, atts)  # after save → real CreateAttachment
+            applied = _attach_all(account, msg, atts) if atts else []
             return (msg.id, getattr(msg, "changekey", None), list(to),
                     list(cc or []), subject or "", applied)
         original = _fetch_one(account, reply_to)
@@ -332,7 +365,12 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
             )
         # Exchange quotes the original server-side, keeping threading headers.
         saved = reply.save(account.drafts)
-        applied = _attach_all(saved, atts)  # after save → real CreateAttachment
+        applied = []
+        if atts:
+            # NOT saved.attach(...): save() hands back a BulkCreateResult.
+            item = _saved_draft_item(account, saved)
+            applied = _attach_all(account, item, atts)
+            saved = item  # carries the changekey attach() just rolled forward
         prev_to = _email_list(getattr(reply, "to_recipients", None)) or list(to or [])
         prev_cc = _email_list(getattr(reply, "cc_recipients", None)) or list(cc or [])
         return (saved.id, getattr(saved, "changekey", None), prev_to, prev_cc,
@@ -384,7 +422,7 @@ async def _update_draft(ctx: Context, *, draft_id: str,
             msg.save(update_fields=changed)
         # AFTER save: attach() rolls the changekey forward, so a save that
         # followed it would collide with its own stale copy.
-        applied = _attach_all(msg, atts)
+        applied = _attach_all(account, msg, atts) if atts else []
         prev_subject = msg.subject if isinstance(msg.subject, str) else None
         preview = {
             "to": _email_list(getattr(msg, "to_recipients", None)),
@@ -818,7 +856,9 @@ TOOLS: List[ToolSpec] = [
             "reply/reply_all/forward need reply_to (the original message id) "
             "and quote the original server-side; forward also needs to. "
             "body is plain text (the server wraps it in minimal HTML). "
-            "importance applies to mode=new only. attachments takes local "
+            "importance applies to mode=new only. A forward/reply draft "
+            "ALREADY carries the original message's attachments — do not "
+            "re-attach them or they go out twice. attachments takes local "
             "file paths on the SERVER host and attaches them to the draft "
             "(confined to DATA_DIR plus ATTACH_ALLOWED_DIRS). "
             "Use send_draft to send."

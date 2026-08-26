@@ -83,7 +83,7 @@ Search mail. TWO ENGINES, mutually exclusive: pass `query` (an Exchange AQS stri
 
 #### `get_message` — read (min tier: read)
 
-Fetch one message by id (short alias from search results, e.g. m12; raw EWS ids also work). format='full' (default) returns recipients, the cleaned body (quoted history stripped — use get_thread for the conversation) and the attachment inventory; format='concise' returns the compact card. A not_found means the id went stale (items move) — re-run search_messages and retry with a fresh id.
+Fetch one message by id (short alias from search results, e.g. m12; raw EWS ids also work). format='full' (default) returns recipients, the cleaned body (quoted history stripped — use get_thread for the conversation) and the attachment inventory; format='concise' returns the compact card. A cache-served read carries only attachments_hint, not the inventory — pass fresh=true to get it. A draft you just created is never in the mirror yet, so verifying an attach ALWAYS needs fresh=true. A not_found means the id went stale (items move) — re-run search_messages and retry with a fresh id.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -221,7 +221,7 @@ Deterministic mirror query: messages YOU sent whose thread has received no inbou
 
 #### `create_draft` — write (min tier: draft)
 
-Author mail as a DRAFT (never sends). mode=new needs to+body; reply/reply_all/forward need reply_to (the original message id) and quote the original server-side; forward also needs to. body is plain text (the server wraps it in minimal HTML). importance applies to mode=new only. attachments takes local file paths on the SERVER host and attaches them to the draft (confined to DATA_DIR plus ATTACH_ALLOWED_DIRS). Use send_draft to send.
+Author mail as a DRAFT (never sends). mode=new needs to+body; reply/reply_all/forward need reply_to (the original message id) and quote the original server-side; forward also needs to. body is plain text (the server wraps it in minimal HTML). importance applies to mode=new only. A forward/reply draft ALREADY carries the original message's attachments — do not re-attach them or they go out twice. attachments takes local file paths on the SERVER host and attaches them to the draft (confined to DATA_DIR plus ATTACH_ALLOWED_DIRS). Use send_draft to send.
 
 | parameter | type | required | description |
 |---|---|---|---|

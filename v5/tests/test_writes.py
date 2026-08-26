@@ -96,6 +96,7 @@ class FakeDraftMessage:
         self.changekey = None
         self.save_calls = []
         self.attached = []
+        self.trashed = False
         FakeDraftMessage.last = self
 
     def save(self, **kwargs):
@@ -110,6 +111,9 @@ class FakeDraftMessage:
         assert self.id is not None, "attach() before save() never reaches EWS"
         self.attached.append(attachment)
         self.changekey = f"CK-ATT-{len(self.attached)}"
+
+    def move_to_trash(self):
+        self.trashed = True
 
 
 class FakeCalendarItem:
