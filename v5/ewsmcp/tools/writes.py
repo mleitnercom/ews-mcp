@@ -28,15 +28,22 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
 - ``Item.move(folder)`` returns ``None`` and updates ``item.id`` in place.
 - There is NO follow-up-flag parameter anywhere: 5.0.3 has no first-class
   flag field; pretending would be mock-drift bait (categories instead).
+- ``Item.attach(att)`` on a SAVED item issues CreateAttachment immediately
+  and writes the new root changekey back onto the parent in place. On an
+  unsaved item it only appends locally — hence attachments are always
+  applied AFTER ``.save()`` here (the v4 regression this restores was the
+  mirror image: append + save, which never reached the server).
 """
 
 import html as _html
 import logging
+import mimetypes
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from exchangelib import CalendarItem, HTMLBody, Message, OofSettings
+from exchangelib import CalendarItem, FileAttachment, HTMLBody, Message, OofSettings
 from exchangelib.items import (
     SEND_TO_ALL_AND_SAVE_COPY,
     SEND_TO_CHANGED_AND_SAVE_COPY,
@@ -132,6 +139,78 @@ def _prefixed(prefix: str, original_subject: Any) -> str:
     return f"{prefix}{base}"
 
 
+def _attachment_root_error(path: Path, roots: List[Path]) -> ToolError:
+    listed = ", ".join(str(r) for r in roots)
+    return ToolError(
+        "validation",
+        f"attachment path is outside the allowed roots: {path}",
+        hint=f"Allowed roots: {listed}. Add more via ATTACH_ALLOWED_DIRS "
+             "(os.pathsep-separated) or move the file under one of them.",
+    )
+
+
+def _resolve_attachment_path(raw: str, roots: List[Path]) -> Path:
+    """Resolve one caller-supplied path and confine it to the allowlist.
+
+    ``resolve()`` collapses ``..`` and follows symlinks BEFORE the containment
+    check, so neither traversal nor a symlink planted inside an allowed root
+    can reach outside it."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolError("validation", "attachment paths must be non-empty strings")
+    try:
+        path = Path(raw).expanduser().resolve()
+    except OSError as exc:
+        raise ToolError("validation", f"cannot resolve attachment path {raw!r}: {exc}")
+    if not any(path == root or root in path.parents for root in roots):
+        raise _attachment_root_error(path, roots)
+    if not path.exists():
+        raise ToolError("not_found", f"attachment file does not exist: {path}")
+    if not path.is_file():
+        raise ToolError("validation", f"attachment path is not a file: {path}")
+    return path
+
+
+def _load_attachments(settings: Any, paths: List[str]) -> List[FileAttachment]:
+    """Read the files into FileAttachment objects, enforcing count and size
+    caps BEFORE anything touches EWS."""
+    if len(paths) > settings.attach_max_files:
+        raise ToolError(
+            "validation",
+            f"at most {settings.attach_max_files} attachments per draft "
+            f"(got {len(paths)})",
+        )
+    roots = settings.attachment_roots()
+    resolved = [_resolve_attachment_path(p, roots) for p in paths]
+    total = 0
+    for path in resolved:
+        total += path.stat().st_size
+        if total > settings.attach_max_bytes:
+            raise ToolError(
+                "validation",
+                f"attachments exceed the {settings.attach_max_bytes} byte cap "
+                f"for one draft",
+                hint="Raise ATTACH_MAX_BYTES, or send fewer/smaller files. "
+                     "Exchange enforces its own message size limit on top.",
+            )
+    out: List[FileAttachment] = []
+    for path in resolved:
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        out.append(FileAttachment(name=path.name,
+                                  content=path.read_bytes(),
+                                  content_type=content_type))
+    return out
+
+
+def _attach_all(msg: Any, atts: List[FileAttachment]) -> List[Dict[str, Any]]:
+    """Attach to an ALREADY SAVED item — each attach() is one CreateAttachment
+    round trip that rolls the parent changekey forward in place."""
+    applied: List[Dict[str, Any]] = []
+    for att in atts:
+        msg.attach(att)
+        applied.append({"name": att.name, "size_bytes": len(att.content or b"")})
+    return applied
+
+
 def _fetch_one(account: Any, raw_id: str) -> Any:
     """account.fetch yields items in input order; missing ids surface as
     in-line exception instances (exchangelib bulk semantics)."""
@@ -200,7 +279,8 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
                         cc: Optional[List[str]] = None,
                         bcc: Optional[List[str]] = None,
                         subject: Optional[str] = None,
-                        importance: Optional[str] = None) -> Dict[str, Any]:
+                        importance: Optional[str] = None,
+                        attachments: Optional[List[str]] = None) -> Dict[str, Any]:
     if mode not in _DRAFT_MODES:
         raise ToolError("validation", f"mode must be one of {_DRAFT_MODES}, got {mode!r}")
     if mode != "new" and not reply_to:
@@ -210,6 +290,9 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
     if importance not in (None, "normal", "high"):
         raise ToolError("validation", "importance must be 'normal' or 'high'")
     html_body = _wrap_html(body)
+    # Read and validate the files up front: a bad path must fail before a
+    # draft exists, not leave a half-populated one behind.
+    atts = _load_attachments(ctx.settings, attachments) if attachments else []
 
     def work(account: Any) -> Any:
         if mode == "new":
@@ -223,7 +306,9 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
             if importance == "high":
                 msg.importance = "High"
             msg.save()  # SAVE_ONLY into Drafts — nothing leaves the mailbox
-            return msg.id, getattr(msg, "changekey", None), list(to), list(cc or []), subject or ""
+            applied = _attach_all(msg, atts)  # after save → real CreateAttachment
+            return (msg.id, getattr(msg, "changekey", None), list(to),
+                    list(cc or []), subject or "", applied)
         original = _fetch_one(account, reply_to)
         extra: Dict[str, Any] = {}
         if mode == "reply":
@@ -247,17 +332,22 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
             )
         # Exchange quotes the original server-side, keeping threading headers.
         saved = reply.save(account.drafts)
+        applied = _attach_all(saved, atts)  # after save → real CreateAttachment
         prev_to = _email_list(getattr(reply, "to_recipients", None)) or list(to or [])
         prev_cc = _email_list(getattr(reply, "cc_recipients", None)) or list(cc or [])
-        return saved.id, getattr(saved, "changekey", None), prev_to, prev_cc, final_subject
+        return (saved.id, getattr(saved, "changekey", None), prev_to, prev_cc,
+                final_subject, applied)
 
-    raw_id, changekey, prev_to, prev_cc, prev_subject = await ctx.gateway.call(work)
+    raw_id, changekey, prev_to, prev_cc, prev_subject, applied = await ctx.gateway.call(work)
     alias = ctx.aliaser.alias_for(str(raw_id), "d", changekey=changekey)
+    preview = _draft_preview(prev_to, prev_cc, prev_subject, body)
+    if applied:
+        preview["attachments"] = applied
     return {
         "ok": True,
         "draft_id": alias,
         "folder": "f:drafts",
-        "preview": _draft_preview(prev_to, prev_cc, prev_subject, body),
+        "preview": preview,
         "note": "saved as draft — NOT sent",
     }
 
@@ -267,9 +357,14 @@ async def _update_draft(ctx: Context, *, draft_id: str,
                         cc: Optional[List[str]] = None,
                         bcc: Optional[List[str]] = None,
                         subject: Optional[str] = None,
-                        body: Optional[str] = None) -> Dict[str, Any]:
-    if to is None and cc is None and bcc is None and subject is None and body is None:
-        raise ToolError("validation", "nothing to update: pass to/cc/bcc/subject/body")
+                        body: Optional[str] = None,
+                        attachments: Optional[List[str]] = None) -> Dict[str, Any]:
+    if (to is None and cc is None and bcc is None and subject is None
+            and body is None and not attachments):
+        raise ToolError(
+            "validation",
+            "nothing to update: pass to/cc/bcc/subject/body/attachments")
+    atts = _load_attachments(ctx.settings, attachments) if attachments else []
 
     def work(account: Any) -> Dict[str, Any]:
         msg = _fetch_one(account, draft_id)
@@ -285,14 +380,21 @@ async def _update_draft(ctx: Context, *, draft_id: str,
         if body is not None:
             msg.body = _wrap_html(body)
             changed.append("body")
-        msg.save(update_fields=changed)
+        if changed:  # attachments-only calls must not issue an empty update
+            msg.save(update_fields=changed)
+        # AFTER save: attach() rolls the changekey forward, so a save that
+        # followed it would collide with its own stale copy.
+        applied = _attach_all(msg, atts)
         prev_subject = msg.subject if isinstance(msg.subject, str) else None
-        return {
+        preview = {
             "to": _email_list(getattr(msg, "to_recipients", None)),
             "cc": _email_list(getattr(msg, "cc_recipients", None)),
             "subject": prev_subject,
             "body_snippet": (body or "")[:200] if body is not None else None,
         }
+        if applied:
+            preview["attachments_added"] = applied
+        return preview
 
     preview = await ctx.gateway.call(work)
     return {"ok": True, "draft_id": ctx.aliaser.alias_for(draft_id, "d"),
@@ -695,6 +797,15 @@ _BOOL = {"type": "boolean"}
 _EMAILS = {"type": "array", "items": {"type": "string"}}
 _IDS = {"type": "array", "items": {"type": "string"},
         "minItems": 1, "maxItems": MAX_BULK_IDS}
+def _paths(description: str) -> Dict[str, Any]:
+    return {"type": "array", "items": {"type": "string"},
+            "description": description}
+
+
+_ATTACH_NOTE = ("Absolute paths to files on the SERVER host. Confined to "
+                "DATA_DIR plus ATTACH_ALLOWED_DIRS; anything else is refused. "
+                "To attach a file you first read from another message, call "
+                "get_attachment(mode='save') and pass its saved_path back.")
 
 
 # --- the pack -----------------------------------------------------------------
@@ -707,7 +818,10 @@ TOOLS: List[ToolSpec] = [
             "reply/reply_all/forward need reply_to (the original message id) "
             "and quote the original server-side; forward also needs to. "
             "body is plain text (the server wraps it in minimal HTML). "
-            "importance applies to mode=new only. Use send_draft to send."
+            "importance applies to mode=new only. attachments takes local "
+            "file paths on the SERVER host and attaches them to the draft "
+            "(confined to DATA_DIR plus ATTACH_ALLOWED_DIRS). "
+            "Use send_draft to send."
         ),
         side_effect_class="write",
         input_schema=_obj({
@@ -715,6 +829,7 @@ TOOLS: List[ToolSpec] = [
             "reply_to": _STR, "to": _EMAILS, "cc": _EMAILS, "bcc": _EMAILS,
             "subject": _STR, "body": _STR,
             "importance": {"type": "string", "enum": ["normal", "high"]},
+            "attachments": _paths("Files to attach to the new draft. " + _ATTACH_NOTE),
         }, required=["body"]),
         handler=_create_draft,
         confirm=False,
@@ -722,11 +837,15 @@ TOOLS: List[ToolSpec] = [
     ToolSpec(
         name="update_draft",
         description=("Update fields of an existing draft (to/cc/bcc/subject/body). "
-                     "Only the supplied fields change."),
+                     "Only the supplied fields change. attachments takes local "
+                     "file paths on the SERVER host and ADDS them to the draft "
+                     "(existing attachments are kept)."),
         side_effect_class="write",
         input_schema=_obj({
             "draft_id": _STR, "to": _EMAILS, "cc": _EMAILS, "bcc": _EMAILS,
             "subject": _STR, "body": _STR,
+            "attachments": _paths("Files to ADD to the draft (existing "
+                                  "attachments are kept). " + _ATTACH_NOTE),
         }, required=["draft_id"]),
         handler=_update_draft,
         confirm=False,

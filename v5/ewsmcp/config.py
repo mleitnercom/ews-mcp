@@ -1,7 +1,8 @@
 """Environment-driven configuration (12-factor; every knob defaults safe)."""
 
+import os
 from pathlib import Path
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +59,17 @@ class Settings(BaseSettings):
     data_dir: str = ""  # empty → ~/.ewsmcp; always resolved to an absolute path
     data_dir_allow_synced: bool = False  # explicit opt-out of the synced-path guard
 
+    # --- Outbound attachments -----------------------------------------------
+    # Attaching a local file means the server reads it and Exchange stores a
+    # copy — everything the process can read could otherwise ride out on a
+    # draft. Outbound file access is therefore confined to an explicit
+    # allowlist of roots (os.pathsep-separated). Empty → DATA_DIR only, i.e.
+    # exactly where get_attachment(mode='save') writes, so the
+    # download → re-attach round trip works out of the box and nothing else.
+    attach_allowed_dirs: str = ""
+    attach_max_files: int = 10
+    attach_max_bytes: int = 26_214_400  # 25 MiB total per draft
+
     # --- Cache mirror (cache-first reads; false = pure EWS, fully functional)
     ews_cache_enabled: bool = True
     ews_cache_folders: str = "inbox,sent"
@@ -93,6 +105,20 @@ class Settings(BaseSettings):
                 )
         self.data_dir = str(resolved)
         return self
+
+    def attachment_roots(self) -> List[Path]:
+        """Resolved roots a draft attachment may be read from. DATA_DIR is
+        always included; ATTACH_ALLOWED_DIRS adds to it, never replaces it."""
+        roots = [Path(self.data_dir)]
+        for raw in (self.attach_allowed_dirs or "").split(os.pathsep):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                roots.append(Path(raw).expanduser().resolve())
+            except OSError:  # an unreadable root must not break startup
+                continue
+        return roots
 
 
 def get_settings() -> Settings:

@@ -221,7 +221,7 @@ Deterministic mirror query: messages YOU sent whose thread has received no inbou
 
 #### `create_draft` — write (min tier: draft)
 
-Author mail as a DRAFT (never sends). mode=new needs to+body; reply/reply_all/forward need reply_to (the original message id) and quote the original server-side; forward also needs to. body is plain text (the server wraps it in minimal HTML). importance applies to mode=new only. Use send_draft to send.
+Author mail as a DRAFT (never sends). mode=new needs to+body; reply/reply_all/forward need reply_to (the original message id) and quote the original server-side; forward also needs to. body is plain text (the server wraps it in minimal HTML). importance applies to mode=new only. attachments takes local file paths on the SERVER host and attaches them to the draft (confined to DATA_DIR plus ATTACH_ALLOWED_DIRS). Use send_draft to send.
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -233,10 +233,11 @@ Author mail as a DRAFT (never sends). mode=new needs to+body; reply/reply_all/fo
 | `subject` | string | no |  |
 | `body` | string | yes |  |
 | `importance` | string | no | (one of: `normal`, `high`) |
+| `attachments` | array | no | Files to attach to the new draft. Absolute paths to files on the SERVER host. Confined to DATA_DIR plus ATTACH_ALLOWED_DIRS; anything else is refused. To attach a file you first read from another message, call get_attachment(mode='save') and pass its saved_path back. |
 
 #### `update_draft` — write (min tier: draft)
 
-Update fields of an existing draft (to/cc/bcc/subject/body). Only the supplied fields change.
+Update fields of an existing draft (to/cc/bcc/subject/body). Only the supplied fields change. attachments takes local file paths on the SERVER host and ADDS them to the draft (existing attachments are kept).
 
 | parameter | type | required | description |
 |---|---|---|---|
@@ -246,6 +247,7 @@ Update fields of an existing draft (to/cc/bcc/subject/body). Only the supplied f
 | `bcc` | array | no |  |
 | `subject` | string | no |  |
 | `body` | string | no |  |
+| `attachments` | array | no | Files to ADD to the draft (existing attachments are kept). Absolute paths to files on the SERVER host. Confined to DATA_DIR plus ATTACH_ALLOWED_DIRS; anything else is refused. To attach a file you first read from another message, call get_attachment(mode='save') and pass its saved_path back. |
 
 #### `delete_draft` — write (min tier: draft)
 

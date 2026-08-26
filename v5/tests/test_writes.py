@@ -95,6 +95,7 @@ class FakeDraftMessage:
         self.id = None
         self.changekey = None
         self.save_calls = []
+        self.attached = []
         FakeDraftMessage.last = self
 
     def save(self, **kwargs):
@@ -102,6 +103,13 @@ class FakeDraftMessage:
         self.id = "RAW-NEW-DRAFT"
         self.changekey = "CK-NEW"
         return self
+
+    def attach(self, attachment):
+        # Mirrors exchangelib: CreateAttachment only happens once the item
+        # is saved, and it rolls the parent changekey forward.
+        assert self.id is not None, "attach() before save() never reaches EWS"
+        self.attached.append(attachment)
+        self.changekey = f"CK-ATT-{len(self.attached)}"
 
 
 class FakeCalendarItem:
