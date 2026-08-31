@@ -34,9 +34,9 @@ Four packs (see the generated table in `docs/API.md`):
 
 - **mail-read** (6): `list_folders`, `search_messages`, `get_message`,
   `get_thread`, `get_attachment`, `get_mailbox_overview`.
-- **calendar / people / status** (7): `list_events`, `get_event`,
+- **calendar / people / status** (8): `list_events`, `get_event`,
   `check_availability`, `find_people`, `get_contact`, `get_oof_settings`,
-  `get_server_status`.
+  `get_server_status`, `get_operation_status`.
 - **tasks / waiting-on** (3): `list_tasks`, `update_task`, `waiting_on`.
 - **writes** (12): draft lifecycle (`create_draft`, `update_draft`,
   `delete_draft`, `send_draft`), bulk ops (`update_messages`,
@@ -70,6 +70,10 @@ without two model decisions):
   `idempotency_key` + draft) return the cached receipt without a fresh
   token — that is what makes retry-after-timeout safe (Stripe semantics).
 - **Send rate cap** `EWS_MAX_SENDS_PER_HOUR`.
+- **Durable create idempotency**: `create_draft` and `create_event` journal
+  queued/running/rate_limited/completed/failed/unknown outcomes in
+  `DATA_DIR/coordination/control.db`. The worker, not the cancellable MCP
+  coroutine, records completion.
 - The one documented handler-side check: `create_event`/`update_event`
   are write-class for tier purposes, but invitations leave the org, so
   they re-check the kill-switch when (and only when) they would notify.
@@ -97,7 +101,8 @@ call shipped 115,457 chars for a ~150-char message.
   `DATA_DIR`); messages with bodies cleaned ONCE at sync time; FTS5
   external-content index over a normalized shadow text; events, tasks,
   folders, sync tokens; per-sender learned-signature table. SINGLE
-  WRITER; tools read via `mode=ro` connections.
+  WRITER; tools read via `mode=ro` connections. An interprocess writer mutex
+  complements SQLite WAL for multiple stdio processes.
 - `normalize.py`: ONE `normalize_ar()` for index and query — diacritics/
   tatweel stripped, alef/hamza-carrier/teh-marbuta/alef-maqsura folded,
   bidi marks removed, Arabic-Indic digits folded. This is what makes
@@ -112,11 +117,25 @@ call shipped 115,457 chars for a ~150-char message.
   (+ `as_of` for cache); `fresh:true` forces live. `EWS_CACHE_ENABLED=
   false` = pure EWS reads, fully functional.
 
+## §Multi-process coordination
+
+Every process registers an instance in `DATA_DIR/coordination/control.db`.
+A held OS byte-range lock elects one sync leader, and separate bounded
+calendar/read/write/sync lanes prevent a hung calendar view from consuming a
+write worker. Interactive calls have the configured outer request deadline;
+the isolated background-sync job does not reuse that single-request deadline
+for its multi-request cycle. Exchange backoff is stored once per mailbox and
+observed by new processes. Alias writes remain atomic SQLite transactions;
+mirror and audit have explicit interprocess single-writer locks. A single
+shared HTTP process is the recommended endpoint topology when multiple
+assistants are permanent.
+
 ## §Errors — a taxonomy, not tracebacks
 
 `validation | auth_failed | tier_blocked | kill_switch |
-recipient_blocked | confirm_invalid | not_found | throttled | rate_capped
-| upstream_unavailable | upstream_error | internal` — each with an
+recipient_blocked | confirm_invalid | idempotency_conflict | operation_in_progress |
+operation_failed | unsupported_item_type | not_found | throttled | rate_limited |
+rate_capped | upstream_timeout | upstream_unavailable | upstream_error | internal` — each with an
 LLM-directed `hint` and `retry_after_s` where meaningful. Handler
 `TypeError`/`ValueError` map to `validation`, never 502.
 

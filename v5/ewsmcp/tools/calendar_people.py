@@ -1,7 +1,8 @@
 """Tool pack: calendar + people + status — DESIGN.md §Tools (calendar/people).
 
-Six read-class tools: list_events, get_event, check_availability,
-find_people, get_oof_settings, get_server_status. Handlers receive RAW
+Eight read-class tools: list_events, get_event, check_availability,
+find_people, get_contact, get_oof_settings, get_server_status and
+get_operation_status. Handlers receive RAW
 EWS ids (the dispatcher already resolved aliases) and never implement
 safety logic — gates live in tools/base.dispatch.
 
@@ -18,8 +19,10 @@ exchangelib 5.0.3 shapes verified against the installed library:
   ErrorNameResolutionNoResults) — those mean "no match", skip them.
 """
 
+import inspect
 import time
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
 from itertools import islice
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,6 +41,15 @@ MAX_WINDOW_DAYS = 366  # reject absurd windows like '+9999d' before EWS does
 MAX_CONTACT_SCAN = 1000  # cap the personal-contacts substring scan
 _CONTACT_FIELDS = ("display_name", "email_addresses", "job_title",
                    "company_name", "phone_numbers")
+
+
+async def _gateway_call(ctx: Context, fn: Any, *, lane: str = "read",
+                        timeout_s: Optional[float] = None) -> Any:
+    """Use reliability lanes when supported, keeping test/adapter compatibility."""
+    parameters = inspect.signature(ctx.gateway.call).parameters
+    if "lane" in parameters:
+        return await ctx.gateway.call(fn, lane=lane, timeout_s=timeout_s)
+    return await ctx.gateway.call(fn)
 
 
 def _window(start: str, end: str, tz: str) -> Tuple[datetime, datetime]:
@@ -117,13 +129,70 @@ def merge_busy_and_find_slots(
 # -------------------------------------------------------------- handlers
 
 
+def _cached_event_card(row: Any, ctx: Context) -> Dict[str, Any]:
+    card: Dict[str, Any] = {
+        "id": ctx.aliaser.alias_for(str(row["ews_id"]), "e",
+                                    changekey=row["changekey"]),
+        "subject": row["subject"] or "",
+        "start": row["start_iso"],
+        "end": row["end_iso"],
+    }
+    for key in ("location", "organizer", "my_response", "show_as"):
+        try:
+            value = row[key]
+        except (KeyError, IndexError):
+            value = None
+        if value:
+            card[key] = value
+    if row["is_recurring"]:
+        card["recurring"] = True
+    return card
+
+
+def _cached_events(ctx: Context, start_dt: datetime, end_dt: datetime,
+                   offset: int, limit: int) -> Optional[Dict[str, Any]]:
+    if ctx.cache is None or ctx.cache.watermark("events") is None:
+        return None
+    # New mirrors persist exact CalendarView coverage. Never answer an empty
+    # page from cache when the caller asks outside that expanded window.
+    coverage_start = ctx.cache.get_sync_state("events:start")
+    coverage_end = ctx.cache.get_sync_state("events:end")
+    if coverage_start is not None and coverage_end is not None:
+        if (int(start_dt.timestamp()) < int(coverage_start)
+                or int(end_dt.timestamp()) > int(coverage_end)):
+            return None
+    rows, total = ctx.cache.event_page(
+        int(start_dt.timestamp()), int(end_dt.timestamp()), offset, limit)
+    cards = [_cached_event_card(row, ctx) for row in rows]
+    result = envelope(cards, total, offset)
+    result["source"] = "cache"
+    result["as_of"] = datetime.fromtimestamp(
+        ctx.cache.watermark("events"), tz=timezone.utc
+    ).isoformat(timespec="seconds")
+    return result
+
+
 async def _list_events(ctx: Context, start: str = "today", end: str = "+7d",
-                       offset: int = 0, limit: int = 25) -> Dict[str, Any]:
+                       offset: int = 0, limit: int = 25,
+                       fresh: bool = False) -> Dict[str, Any]:
     tz = ctx.settings.ews_tz
     start_dt, end_dt = _window(start, end, tz)
     offset = max(0, int(offset))
     limit = max(0, int(limit))
     cap = offset + limit + 1  # lookahead: is there a page after this one?
+
+    cached: Optional[Dict[str, Any]] = None
+    try:
+        cached = _cached_events(ctx, start_dt, end_dt, offset, limit)
+    except Exception as exc:
+        # A mirror is an acceleration layer. A corrupt/read-locked mirror
+        # degrades to live instead of making the calendar unavailable.
+        cached = None
+        cache_error = f"{type(exc).__name__}: {exc}"
+    else:
+        cache_error = None
+    if cached is not None and not fresh:
+        return cached
 
     def work(account: Any) -> List[Any]:
         # .view() implements CalendarView: it EXPANDS recurring events into
@@ -134,7 +203,17 @@ async def _list_events(ctx: Context, start: str = "today", end: str = "+7d",
         return list(account.calendar.view(start=start_dt, end=end_dt,
                                           max_items=cap))
 
-    items = await ctx.gateway.call(work)
+    try:
+        items = await _gateway_call(
+            ctx, work, lane="calendar",
+            timeout_s=float(ctx.settings.request_timeout),
+        )
+    except Exception as exc:
+        if cached is not None:
+            cached["fallback"] = "live_failed"
+            cached["warning"] = f"{type(exc).__name__}: {exc}"[:500]
+            return cached
+        raise
     truncated = len(items) >= cap
     total = None if truncated else len(items)
     page = items[offset:offset + limit]
@@ -142,7 +221,11 @@ async def _list_events(ctx: Context, start: str = "today", end: str = "+7d",
     if next_offset is not None and not page:
         next_offset = None
     cards = [event_card(item, ctx.aliaser, tz) for item in page]
-    return envelope(cards, total, offset, next_offset=next_offset)
+    result = envelope(cards, total, offset, next_offset=next_offset)
+    result["source"] = "live"
+    if cache_error:
+        result["cache_warning"] = cache_error[:500]
+    return result
 
 
 def _attendee_entries(item: Any) -> List[Dict[str, Any]]:
@@ -477,7 +560,7 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
             cache_block["error"] = str(exc)
     if ctx.sync is not None:
         cache_block["sync"] = ctx.sync.status()
-    return {
+    result = {
         "ok": True,
         "version": __version__,
         "uptime_s": int(time.time() - ctx.started_at),
@@ -489,6 +572,28 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
         "alias_stats": ctx.aliaser.stats(),
         "cache": cache_block,
     }
+    if ctx.coordinator is not None:
+        try:
+            result["coordination"] = ctx.coordinator.status()
+        except Exception as exc:
+            result["coordination"] = {"error": str(exc)}
+    return result
+
+
+async def _get_operation_status(ctx: Context, operation_id: str) -> Dict[str, Any]:
+    if ctx.coordinator is None:
+        raise ToolError(
+            "not_found", "No durable operation journal is available in this process.")
+    operation = ctx.coordinator.operation(operation_id)
+    if operation is None:
+        raise ToolError("not_found", f"No operation found for {operation_id!r}.")
+    result = operation.get("result")
+    if isinstance(result, dict) and result.get("raw_id"):
+        public = dict(result)
+        kind = "d" if operation.get("kind") == "create_draft" else "e"
+        public["item_id"] = ctx.aliaser.alias_for(str(public.pop("raw_id")), kind)
+        operation = {**operation, "result": public}
+    return {"ok": True, "operation": operation}
 
 
 # ---------------------------------------------------------------- specs
@@ -505,6 +610,8 @@ TOOLS: List[ToolSpec] = [
             "occurrence in the window. Returns a paged envelope of compact "
             "event cards; their ids are short aliases (e1, e2, …) you pass "
             "to get_event."
+            " A warm mirror is used by default (source=cache); fresh=true "
+            "requests a bounded live CalendarView and falls back to cache on failure."
         ),
         side_effect_class="read",
         input_schema={
@@ -517,12 +624,15 @@ TOOLS: List[ToolSpec] = [
                 "offset": {"type": "integer", "default": 0, "minimum": 0,
                            "description": "Pagination offset into the window."},
                 "limit": {"type": "integer", "default": 25, "minimum": 1,
-                          "maximum": 100, "description": "Max events returned."},
+                           "maximum": 100, "description": "Max events returned."},
+                "fresh": {"type": "boolean", "default": False,
+                          "description": "Force a bounded live Exchange refresh."},
             },
             "required": [],
             "additionalProperties": False,
         },
         handler=_list_events,
+        requires_ews=False,
     ),
     ToolSpec(
         name="get_event",
@@ -658,6 +768,25 @@ TOOLS: List[ToolSpec] = [
             "additionalProperties": False,
         },
         handler=_get_server_status,
+        requires_ews=False,
+    ),
+    ToolSpec(
+        name="get_operation_status",
+        description=(
+            "Read one durable create-operation journal entry by operation_id. "
+            "States are queued, running, rate_limited, completed, failed or "
+            "unknown_outcome; this never touches Exchange."
+        ),
+        side_effect_class="read",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "operation_id": {"type": "string"},
+            },
+            "required": ["operation_id"],
+            "additionalProperties": False,
+        },
+        handler=_get_operation_status,
         requires_ews=False,
     ),
 ]

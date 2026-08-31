@@ -39,7 +39,9 @@ exchangelib 5.0.3 pins honoured here (verified against the installed lib):
   mirror image: append + save, which never reached the server).
 """
 
+import asyncio
 import html as _html
+import inspect
 import logging
 import mimetypes
 import threading
@@ -54,13 +56,96 @@ from exchangelib.items import (
     SEND_TO_NONE,
 )
 
+from ..calendar_status import SHOW_AS_VALUES, to_ews_show_as, validate_show_as
+from ..coordination import ProcessCoordinator
 from ..dates import parse_when
-from ..errors import ToolError
+from ..dto import fmt_dt
+from ..errors import ToolError, map_exception
 from .base import Context, ToolSpec
 
 logger = logging.getLogger(__name__)
 
 MAX_BULK_IDS = 50
+
+
+async def _gateway_write(ctx: Context, fn: Any) -> Any:
+    parameters = inspect.signature(ctx.gateway.call).parameters
+    if "lane" in parameters:
+        return await ctx.gateway.call(
+            fn, lane="write", timeout_s=float(ctx.settings.request_timeout))
+    return await ctx.gateway.call(fn)
+
+
+def _coordinator(ctx: Context) -> ProcessCoordinator:
+    if ctx.coordinator is None:
+        ctx.coordinator = ProcessCoordinator(ctx.settings.data_dir,
+                                             ctx.settings.ews_email)
+    return ctx.coordinator
+
+
+async def _idempotent_create(ctx: Context, kind: str, key: Optional[str],
+                             payload: Dict[str, Any], fn: Any) -> Dict[str, Any]:
+    """Run a create in the worker that owns its durable operation transition.
+
+    This placement is deliberate: cancelling the MCP coroutine cannot cancel a
+    Python thread already inside exchangelib, but that thread will still record
+    ``completed`` and make a retry with the same key safe.
+    """
+    if not key:
+        return {"state": "completed", "result": await _gateway_write(ctx, fn)}
+    coord = _coordinator(ctx)
+    op, created = coord.reserve_operation(kind, key, payload)
+    if not created:
+        ctx.audit.record(tool=kind, side_effect_class="write",
+                         outcome=op["status"], latency_ms=0,
+                         transport="operation-journal",
+                         detail={"operation_id": op["operation_id"]})
+        if op["status"] == "completed":
+            return {"state": "completed", "result": op.get("result"),
+                    "operation": op, "replayed": True}
+        if op["status"] == "failed":
+            raise ToolError(
+                "operation_failed",
+                op.get("error") or f"Prior {kind} operation failed",
+                hint="Use a new idempotency_key only after verifying Exchange state.",
+            )
+        return {"state": op["status"], "operation": op}
+    op_id = op["operation_id"]
+    ctx.audit.record(tool=kind, side_effect_class="write", outcome="queued",
+                     latency_ms=0, transport="operation-journal",
+                     detail={"operation_id": op_id})
+
+    def durable(account: Any) -> Any:
+        started = time.time()
+        ctx.audit.record(tool=kind, side_effect_class="write", outcome="running",
+                         latency_ms=0, transport="operation-journal",
+                         detail={"operation_id": op_id})
+        try:
+            return coord.execute_operation(op_id, lambda: fn(account))
+        finally:
+            current = coord.operation(op_id) or {"status": "unknown_outcome"}
+            ctx.audit.record(
+                tool=kind, side_effect_class="write", outcome=current["status"],
+                latency_ms=int((time.time() - started) * 1000),
+                transport="operation-journal", detail={"operation_id": op_id})
+
+    try:
+        result = await _gateway_write(ctx, durable)
+        return {"state": "completed", "result": result,
+                "operation": coord.operation(op_id)}
+    except asyncio.CancelledError:
+        coord.mark_unknown(op_id, "client cancelled while Exchange call was running")
+        raise
+    except ToolError as exc:
+        coord.mark_unknown(op_id, f"{exc.code}: {exc.message}")
+        current = coord.operation(op_id) or op
+        return {"state": current["status"], "operation": current,
+                "error": exc.to_dict()["error"]}
+    except Exception as exc:
+        mapped = map_exception(exc)
+        current = coord.operation(op_id) or op
+        return {"state": current["status"], "operation": current,
+                "error": mapped.to_dict()["error"]}
 
 
 def _write_through(ctx: Context, method: str, *args: Any) -> None:
@@ -313,7 +398,8 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
                         bcc: Optional[List[str]] = None,
                         subject: Optional[str] = None,
                         importance: Optional[str] = None,
-                        attachments: Optional[List[str]] = None) -> Dict[str, Any]:
+                        attachments: Optional[List[str]] = None,
+                        idempotency_key: Optional[str] = None) -> Dict[str, Any]:
     if mode not in _DRAFT_MODES:
         raise ToolError("validation", f"mode must be one of {_DRAFT_MODES}, got {mode!r}")
     if mode != "new" and not reply_to:
@@ -327,7 +413,7 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
     # draft exists, not leave a half-populated one behind.
     atts = _load_attachments(ctx.settings, attachments) if attachments else []
 
-    def work(account: Any) -> Any:
+    def work(account: Any) -> Dict[str, Any]:
         if mode == "new":
             msg = Message(
                 account=account, folder=account.drafts,
@@ -340,10 +426,12 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
                 msg.importance = "High"
             msg.save()  # SAVE_ONLY into Drafts — nothing leaves the mailbox
             applied = _attach_all(account, msg, atts) if atts else []
-            return (msg.id, getattr(msg, "changekey", None), list(to),
-                    list(cc or []), subject or "", applied)
+            return {"raw_id": str(msg.id), "changekey": getattr(msg, "changekey", None),
+                    "to": list(to), "cc": list(cc or []), "subject": subject or "",
+                    "attachments": applied}
         original = _fetch_one(account, reply_to)
         extra: Dict[str, Any] = {}
+        fallback = None
         if mode == "reply":
             final_subject = subject or _prefixed("Re: ", getattr(original, "subject", None))
             if to:
@@ -352,10 +440,12 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
                 extra["cc_recipients"] = list(cc)
             if bcc:
                 extra["bcc_recipients"] = list(bcc)
-            reply = original.create_reply(final_subject, html_body, **extra)
+            method = getattr(original, "create_reply", None)
+            reply = method(final_subject, html_body, **extra) if callable(method) else None
         elif mode == "reply_all":
             final_subject = subject or _prefixed("Re: ", getattr(original, "subject", None))
-            reply = original.create_reply_all(final_subject, html_body)
+            method = getattr(original, "create_reply_all", None)
+            reply = method(final_subject, html_body) if callable(method) else None
         else:  # forward — create_forward REQUIRES to_recipients (5.0.3)
             final_subject = subject or _prefixed("Fwd: ", getattr(original, "subject", None))
             reply = original.create_forward(
@@ -363,8 +453,44 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
                 cc_recipients=list(cc) if cc else None,
                 bcc_recipients=list(bcc) if bcc else None,
             )
+        if mode in ("reply", "reply_all") and reply is None:
+            # MeetingResponse has no create_reply/create_reply_all in
+            # exchangelib 5.0.3. Reconstruct a transparent draft instead of
+            # leaking AttributeError. The sender is the primary reply target;
+            # reply_all additionally retains original To/Cc recipients except
+            # the mailbox itself. Explicit caller recipients still win.
+            sender = getattr(original, "sender", None)
+            sender_address = getattr(sender, "email_address", None)
+            recipients = list(to or ([] if not sender_address else [sender_address]))
+            copied = list(cc or [])
+            if mode == "reply_all" and not to:
+                own = str(getattr(account, "primary_smtp_address", "") or "").lower()
+                for recipient in [*(getattr(original, "to_recipients", None) or []),
+                                  *(getattr(original, "cc_recipients", None) or [])]:
+                    address = getattr(recipient, "email_address", None) or str(recipient)
+                    if address and address.lower() != own and address not in recipients + copied:
+                        copied.append(address)
+            if not recipients and not copied:
+                raise ToolError(
+                    "unsupported_item_type",
+                    f"Cannot reconstruct {mode} recipients for "
+                    f"{type(original).__name__}",
+                    hint="Pass explicit to/cc recipients or reply from Outlook.",
+                )
+            reply = Message(
+                account=account, folder=account.drafts, subject=final_subject,
+                body=html_body, to_recipients=recipients,
+                cc_recipients=copied or None,
+                bcc_recipients=list(bcc) if bcc else None,
+            )
+            fallback = f"reconstructed_{type(original).__name__}"
+
         # Exchange quotes the original server-side, keeping threading headers.
-        saved = reply.save(account.drafts)
+        if fallback:
+            reply.save()
+            saved = reply
+        else:
+            saved = reply.save(account.drafts)
         applied = []
         if atts:
             # NOT saved.attach(...): save() hands back a BulkCreateResult.
@@ -373,21 +499,43 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
             saved = item  # carries the changekey attach() just rolled forward
         prev_to = _email_list(getattr(reply, "to_recipients", None)) or list(to or [])
         prev_cc = _email_list(getattr(reply, "cc_recipients", None)) or list(cc or [])
-        return (saved.id, getattr(saved, "changekey", None), prev_to, prev_cc,
-                final_subject, applied)
+        return {"raw_id": str(saved.id), "changekey": getattr(saved, "changekey", None),
+                "to": prev_to, "cc": prev_cc, "subject": final_subject,
+                "attachments": applied, "fallback": fallback}
 
-    raw_id, changekey, prev_to, prev_cc, prev_subject, applied = await ctx.gateway.call(work)
-    alias = ctx.aliaser.alias_for(str(raw_id), "d", changekey=changekey)
-    preview = _draft_preview(prev_to, prev_cc, prev_subject, body)
+    payload = {"mode": mode, "reply_to": reply_to, "to": to, "cc": cc, "bcc": bcc,
+               "subject": subject, "body": body, "importance": importance,
+               "attachments": attachments}
+    outcome = await _idempotent_create(ctx, "create_draft", idempotency_key,
+                                       payload, work)
+    if outcome["state"] != "completed":
+        return {"ok": False, "error": outcome.get("error", {
+                    "code": "operation_in_progress",
+                    "message": "Draft create is still running; retry with the same key.",
+                }), "operation": outcome["operation"]}
+    created = outcome["result"]
+    alias = ctx.aliaser.alias_for(str(created["raw_id"]), "d",
+                                  changekey=created.get("changekey"))
+    preview = _draft_preview(created.get("to") or [], created.get("cc") or [],
+                             created.get("subject") or "", body)
+    applied = created.get("attachments") or []
     if applied:
         preview["attachments"] = applied
-    return {
+    result = {
         "ok": True,
         "draft_id": alias,
         "folder": "f:drafts",
         "preview": preview,
         "note": "saved as draft — NOT sent",
     }
+    if created.get("fallback"):
+        result["fallback"] = created["fallback"]
+        result["note"] += "; recipients reconstructed because the source item has no reply API"
+    if outcome.get("operation"):
+        result["operation"] = outcome["operation"]
+    if outcome.get("replayed"):
+        result["idempotent_replay"] = True
+    return result
 
 
 async def _update_draft(ctx: Context, *, draft_id: str,
@@ -434,7 +582,7 @@ async def _update_draft(ctx: Context, *, draft_id: str,
             preview["attachments_added"] = applied
         return preview
 
-    preview = await ctx.gateway.call(work)
+    preview = await _gateway_write(ctx, work)
     return {"ok": True, "draft_id": ctx.aliaser.alias_for(draft_id, "d"),
             "preview": preview}
 
@@ -446,7 +594,7 @@ async def _delete_draft(ctx: Context, *, draft_id: str) -> Dict[str, Any]:
         msg.move_to_trash()  # reversible — hence write class, no confirm
         return {"deleted": True}
 
-    return await ctx.gateway.call(work)
+    return await _gateway_write(ctx, work)
 
 
 async def _update_messages(ctx: Context, *, ids: List[str],
@@ -491,7 +639,7 @@ async def _update_messages(ctx: Context, *, ids: List[str],
                 failed.append(_failed_entry(ctx, raw_id, exc))
         return {"updated": updated, "failed": failed}
 
-    result = await ctx.gateway.call(work)
+    result = await _gateway_write(ctx, work)
     if ok_ids and set_read is not None:
         _write_through(ctx, "set_read_flag", ok_ids, bool(set_read))
     for raw_id, cats in final_cats:
@@ -534,7 +682,7 @@ async def _move_messages(ctx: Context, *, ids: List[str],
                 failed.append(_failed_entry(ctx, raw_id, exc))
         return {"moved": len(moved), "items": moved, "failed": failed}
 
-    result = await ctx.gateway.call(work)
+    result = await _gateway_write(ctx, work)
     # Tombstone the moved rows: their old ids are gone from the source
     # folder; the delta sync re-adds them under the new id if the target
     # folder is mirrored.
@@ -546,7 +694,9 @@ async def _create_event(ctx: Context, *, subject: str, start: str, end: str,
                         attendees: Optional[List[str]] = None,
                         location: Optional[str] = None,
                         body: Optional[str] = None,
-                        send_invitations: bool = False) -> Dict[str, Any]:
+                        send_invitations: bool = False,
+                        show_as: Optional[str] = None,
+                        idempotency_key: Optional[str] = None) -> Dict[str, Any]:
     # The ONE handler-side safety check in this pack, by design: this tool is
     # class "write" so a no-invite event stays available at draft tier, but
     # the dispatcher kill-switch only covers class "send". Invitations leave
@@ -564,8 +714,9 @@ async def _create_event(ctx: Context, *, subject: str, start: str, end: str,
     end_dt = parse_when(end, "end", ctx.settings.ews_tz)
     if end_dt <= start_dt:
         raise ToolError("validation", "end must be after start")
+    normalized_show_as = validate_show_as(show_as)
 
-    def work(account: Any) -> str:
+    def work(account: Any) -> Dict[str, Any]:
         item = CalendarItem(account=account, folder=account.calendar,
                             subject=subject, start=start_dt, end=end_dt)
         if attendees:
@@ -575,13 +726,42 @@ async def _create_event(ctx: Context, *, subject: str, start: str, end: str,
             item.location = location
         if body is not None:
             item.body = _wrap_html(body)
+        if normalized_show_as is not None:
+            item.legacy_free_busy_status = to_ews_show_as(normalized_show_as)
         item.save(send_meeting_invitations=SEND_TO_ALL_AND_SAVE_COPY
                   if send_invitations else SEND_TO_NONE)
-        return str(item.id)
+        return {"raw_id": str(item.id), "show_as": normalized_show_as}
 
-    raw_id = await ctx.gateway.call(work)
-    return {"ok": True, "event_id": ctx.aliaser.alias_for(raw_id, "e"),
-            "invitations_sent": bool(send_invitations)}
+    payload = {"subject": subject, "start": start, "end": end,
+               "attendees": attendees, "location": location, "body": body,
+               "send_invitations": send_invitations, "show_as": normalized_show_as}
+    outcome = await _idempotent_create(ctx, "create_event", idempotency_key,
+                                       payload, work)
+    if outcome["state"] != "completed":
+        return {"ok": False, "error": outcome.get("error", {
+                    "code": "operation_in_progress",
+                    "message": "Event create is still running; retry with the same key.",
+                }), "operation": outcome["operation"]}
+    created = outcome["result"]
+    result = {"ok": True,
+              "event_id": ctx.aliaser.alias_for(created["raw_id"], "e"),
+              "invitations_sent": bool(send_invitations)}
+    if created.get("show_as"):
+        result["show_as"] = created["show_as"]
+    if outcome.get("operation"):
+        result["operation"] = outcome["operation"]
+    if outcome.get("replayed"):
+        result["idempotent_replay"] = True
+    _write_through(ctx, "upsert_events", [{
+        "ews_id": created["raw_id"], "changekey": None, "subject": subject,
+        "start_ts": int(start_dt.timestamp()),
+        "start_iso": fmt_dt(start_dt, ctx.settings.ews_tz),
+        "end_ts": int(end_dt.timestamp()),
+        "end_iso": fmt_dt(end_dt, ctx.settings.ews_tz),
+        "location": location, "organizer": None, "is_recurring": 0,
+        "my_response": None, "show_as": normalized_show_as,
+    }])
+    return result
 
 
 async def _update_event(ctx: Context, *, event_id: str,
@@ -590,6 +770,7 @@ async def _update_event(ctx: Context, *, event_id: str,
                         end: Optional[str] = None,
                         location: Optional[str] = None,
                         body: Optional[str] = None,
+                        show_as: Optional[str] = None,
                         notify_attendees: bool = False) -> Dict[str, Any]:
     # Same documented exception as create_event: write-class for tier, but
     # notifications leave the org → the send kill-switch applies.
@@ -600,9 +781,10 @@ async def _update_event(ctx: Context, *, event_id: str,
             "SEND_ENABLED=false on this server.",
             hint="Update without notifying, or have the operator flip SEND_ENABLED.",
         )
-    if all(v is None for v in (subject, start, end, location, body)):
+    if all(v is None for v in (subject, start, end, location, body, show_as)):
         raise ToolError("validation",
-                        "nothing to update: pass subject/start/end/location/body")
+                        "nothing to update: pass subject/start/end/location/body/show_as")
+    normalized_show_as = validate_show_as(show_as)
     start_dt = parse_when(start, "start", ctx.settings.ews_tz) if start else None
     end_dt = parse_when(end, "end", ctx.settings.ews_tz) if end else None
 
@@ -617,12 +799,34 @@ async def _update_event(ctx: Context, *, event_id: str,
         if body is not None:
             item.body = _wrap_html(body)
             changed.append("body")
+        if normalized_show_as is not None:
+            item.legacy_free_busy_status = to_ews_show_as(normalized_show_as)
+            changed.append("legacy_free_busy_status")
         item.save(update_fields=changed,
                   send_meeting_invitations=SEND_TO_CHANGED_AND_SAVE_COPY
                   if notify_attendees else SEND_TO_NONE)
         return {"updated_fields": changed, "attendees_notified": bool(notify_attendees)}
 
-    return await ctx.gateway.call(work)
+    result = await _gateway_write(ctx, work)
+    cache_fields: Dict[str, Any] = {}
+    if subject is not None:
+        cache_fields["subject"] = subject
+    if start_dt is not None:
+        cache_fields.update({
+            "start_ts": int(start_dt.timestamp()),
+            "start_iso": fmt_dt(start_dt, ctx.settings.ews_tz),
+        })
+    if end_dt is not None:
+        cache_fields.update({
+            "end_ts": int(end_dt.timestamp()),
+            "end_iso": fmt_dt(end_dt, ctx.settings.ews_tz),
+        })
+    if location is not None:
+        cache_fields["location"] = location
+    if normalized_show_as is not None:
+        cache_fields["show_as"] = normalized_show_as
+    _write_through(ctx, "patch_event", event_id, cache_fields)
+    return result
 
 
 # --- SEND class (leaves the mailbox; tier full, two-phase, kill-switch) ------
@@ -669,7 +873,7 @@ async def _send_draft_preview(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str,
         _require_in_drafts(msg, account, "send_draft")
         return _draft_content(msg)
 
-    content = await ctx.gateway.call(work)
+    content = await _gateway_write(ctx, work)
     content["draft_id"] = draft_id  # echo the caller's handle in the preview
     return content
 
@@ -713,7 +917,7 @@ async def _send_draft(ctx: Context, *, draft_id: str,
         return {"sent": True,
                 "internet_message_id": imid if isinstance(imid, str) else None}
 
-    result = await ctx.gateway.call(work)
+    result = await _gateway_write(ctx, work)
     if idempotency_key:
         _idempotency_put(idempotency_key, {"draft_id": draft_id,
                                            "result": dict(result),
@@ -736,7 +940,7 @@ async def _respond_to_event(ctx: Context, *, event_id: str, response: str,
         getattr(item, method)(**kwargs)
         return {"responded": response}
 
-    return await ctx.gateway.call(work)
+    return await _gateway_write(ctx, work)
 
 
 async def _set_oof(ctx: Context, *, state: str,
@@ -769,7 +973,7 @@ async def _set_oof(ctx: Context, *, state: str,
         account.oof_settings = OofSettings(**kwargs)
         return {"state": state}
 
-    return await ctx.gateway.call(work)
+    return await _gateway_write(ctx, work)
 
 
 # --- DESTRUCTIVE class (tier full) -------------------------------------------
@@ -785,7 +989,7 @@ async def _cancel_event(ctx: Context, *, event_id: str,
         item.cancel(**kwargs)
         return {"cancelled": True}
 
-    return await ctx.gateway.call(work)
+    return await _gateway_write(ctx, work)
 
 
 async def _delete_messages(ctx: Context, *, ids: List[str],
@@ -817,7 +1021,7 @@ async def _delete_messages(ctx: Context, *, ids: List[str],
                 failed.append(_failed_entry(ctx, raw_id, exc))
         return {"deleted": deleted, "disposition": disposition, "failed": failed}
 
-    result = await ctx.gateway.call(work)
+    result = await _gateway_write(ctx, work)
     _write_through(ctx, "tombstone_messages", deleted_ids)
     return result
 
@@ -862,6 +1066,9 @@ TOOLS: List[ToolSpec] = [
             "file paths on the SERVER host and attaches them to the draft "
             "(confined to DATA_DIR plus ATTACH_ALLOWED_DIRS). "
             "Use send_draft to send."
+            " MeetingResponse items without a native reply API use a transparent "
+            "recipient-reconstruction fallback. Optional idempotency_key makes "
+            "create retries safe across processes."
         ),
         side_effect_class="write",
         input_schema=_obj({
@@ -870,6 +1077,8 @@ TOOLS: List[ToolSpec] = [
             "subject": _STR, "body": _STR,
             "importance": {"type": "string", "enum": ["normal", "high"]},
             "attachments": _paths("Files to attach to the new draft. " + _ATTACH_NOTE),
+            "idempotency_key": {"type": "string", "minLength": 1,
+                                "description": "Deduplicate safe retries across processes."},
         }, required=["body"]),
         handler=_create_draft,
         confirm=False,
@@ -933,11 +1142,17 @@ TOOLS: List[ToolSpec] = [
             "placeholder WITHOUT emailing attendees (no confirm needed). With "
             "send_invitations=true, invitations leave the org: two-phase "
             "confirm + send kill-switch apply."
+            " Optional show_as includes working_elsewhere (Outlook: An einem "
+            "anderen Ort); idempotency_key makes create retries safe."
         ),
         side_effect_class="write",  # tier: draft; invite path confirm-gated below
         input_schema=_obj({
             "subject": _STR, "start": _STR, "end": _STR,
             "attendees": _EMAILS, "location": _STR, "body": _STR,
+            "show_as": {"type": "string", "enum": list(SHOW_AS_VALUES),
+                        "description": "Outlook free/busy display status."},
+            "idempotency_key": {"type": "string", "minLength": 1,
+                                "description": "Deduplicate safe retries across processes."},
             "send_invitations": {"type": "boolean", "default": False},
         }, required=["subject", "start", "end"]),
         handler=_create_event,
@@ -946,7 +1161,7 @@ TOOLS: List[ToolSpec] = [
     ToolSpec(
         name="update_event",
         description=(
-            "Update event fields (subject/start/end/location/body). Default "
+            "Update event fields (subject/start/end/location/body/show_as). Default "
             "notify_attendees=false is a silent metadata edit; true notifies "
             "changed attendees → two-phase confirm + send kill-switch apply."
         ),
@@ -954,6 +1169,8 @@ TOOLS: List[ToolSpec] = [
         input_schema=_obj({
             "event_id": _STR, "subject": _STR, "start": _STR, "end": _STR,
             "location": _STR, "body": _STR,
+            "show_as": {"type": "string", "enum": list(SHOW_AS_VALUES),
+                        "description": "Outlook free/busy display status."},
             "notify_attendees": {"type": "boolean", "default": False},
         }, required=["event_id"]),
         handler=_update_event,

@@ -7,12 +7,14 @@ account synchronously. All datetimes are tz-aware Asia/Riyadh.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, timedelta
+from datetime import time as dtime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 from conftest import make_settings
+
 from ewsmcp import __version__
 from ewsmcp.audit import AuditLog
 from ewsmcp.ids import get_aliaser
@@ -62,17 +64,21 @@ def _event(raw_id="RAW-EV-1", subject="Standup", start=None, end=None):
 # --- pack contract ----------------------------------------------------------
 
 
-def test_pack_exports_seven_read_specs():
+def test_pack_exports_eight_read_specs():
     assert [s.name for s in calendar_people.TOOLS] == [
         "list_events", "get_event", "check_availability",
         "find_people", "get_contact", "get_oof_settings", "get_server_status",
+        "get_operation_status",
     ]
     for spec in calendar_people.TOOLS:
         assert spec.side_effect_class == "read"
         assert spec.input_schema["additionalProperties"] is False
         assert isinstance(spec.input_schema["required"], list)
     assert SPEC["get_server_status"].requires_ews is False
-    assert all(s.requires_ews for n, s in SPEC.items() if n != "get_server_status")
+    assert SPEC["list_events"].requires_ews is False
+    assert SPEC["get_operation_status"].requires_ews is False
+    assert all(s.requires_ews for n, s in SPEC.items()
+               if n not in {"list_events", "get_server_status", "get_operation_status"})
 
 
 # --- list_events --------------------------------------------------------------
@@ -422,7 +428,7 @@ def test_get_server_status_with_manager_none(tmp_path):
     assert res["connection"] == {"state": "unmanaged"}
     assert res["tier"] == "draft"
     assert res["send_kill_switch"] is True  # send_enabled defaults False
-    assert res["tools"] == 7
+    assert res["tools"] == 8
     assert res["counters"]["tool.list_events"] == 3
     assert res["alias_stats"] == {"m": 1}
     assert res["cache"]["enabled"] is True  # default posture

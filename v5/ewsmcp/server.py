@@ -8,6 +8,7 @@ from mcp.types import Tool, ToolAnnotations
 
 from .audit import AuditLog
 from .config import Settings
+from .coordination import ProcessCoordinator
 from .gateway.client import EWSGateway
 from .gateway.connection import ConnectionManager
 from .ids import NullAliaser, get_aliaser
@@ -34,7 +35,12 @@ class _NullAudit:
 
 
 def build_context(settings: Settings) -> Context:
-    gateway = EWSGateway(settings)
+    try:
+        coordinator = ProcessCoordinator(settings.data_dir, settings.ews_email)
+    except Exception as exc:
+        logger.error("interprocess coordination unavailable (%s) — process-local only", exc)
+        coordinator = None
+    gateway = EWSGateway(settings, coordinator=coordinator)
     # Aliaser/audit are quality-of-life layers — their storage failing
     # (bad volume, permissions) degrades them to pass-through, never
     # prevents boot: the never-exit contract covers local disks too.
@@ -72,6 +78,7 @@ def build_context(settings: Settings) -> Context:
         audit=audit,
         cache=cache,
         semantic=semantic,
+        coordinator=coordinator,
     )
     build_registry(ctx)
     return ctx
@@ -93,7 +100,8 @@ async def start_connection_manager(ctx: Context) -> None:
             try:
                 from .cache import SyncEngine
                 ctx.sync = SyncEngine(ctx.settings, ctx.gateway, ctx.cache,
-                                      semantic=ctx.semantic)
+                                      semantic=ctx.semantic,
+                                      coordinator=ctx.coordinator)
                 await ctx.sync.start()
             except Exception as exc:
                 logger.error("sync engine start failed (%s) — cache stays "

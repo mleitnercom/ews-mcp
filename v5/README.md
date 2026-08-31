@@ -1,7 +1,7 @@
 # ews-mcp 4.5 — Exchange (EWS) as a safe, fast MCP tool surface
 
 An MCP server that turns an on-prem Exchange mailbox into a lean,
-safety-gated tool surface for an LLM assistant: **28 tools**, alias-only
+safety-gated tool surface for an LLM assistant: **29 tools**, alias-only
 ids, token-lean DTOs, a local cache mirror with Arabic-correct full-text
 search, and a two-phase confirm flow that makes autonomous sending
 tamper-evident.
@@ -73,11 +73,25 @@ credentials in `env`. Prefer a file? Copy [`.env.example`](.env.example)
 to `.env` in the directory you launch `ewsmcp` from — it auto-loads.
 
 That is the whole setup. The defaults are safe: capability tier `draft`
-(23 read + draft tools; nothing can send), `SEND_ENABLED=false` until
+(24 read + draft tools; nothing can send), `SEND_ENABLED=false` until
 you flip it, and mail-at-rest (aliases, audit chain, cache) goes to
 `~/.ewsmcp`. The server **refuses cloud-synced folders** for that data —
 if your home directory lives in OneDrive/Dropbox/iCloud, set `DATA_DIR`
 to a plain local path.
+
+### Multiple clients (Claude + Codex)
+
+Several stdio clients may share one `DATA_DIR`. The server elects exactly
+one cache-sync leader, separates and process-locks live read/calendar/write
+lanes, shares Exchange cooldown state, and serializes mirror/audit writers.
+`get_server_status.coordination` shows the instance id, PID, leader and lock
+holders, active cooldown and waiting calls.
+
+For a workstation that regularly runs several assistants, the preferred
+topology is still one long-lived HTTP instance and multiple clients pointed
+at its `/mcp` endpoint. This removes duplicate connection warmups entirely;
+the built-in coordination is the safe upgrade bridge for existing stdio
+configs.
 
 **First things to try in a chat:**
 
@@ -87,6 +101,8 @@ to a plain local path.
 - "Draft a short reply to m3 saying I'll confirm tomorrow" →
   `create_draft` (saved as a draft, never sent)
 - "What's on my calendar this week?" → `list_events`
+- "Block home office as working elsewhere" →
+  `create_event(..., show_as="working_elsewhere", send_invitations=false)`
 
 Ids like `m3` / `e1` are the server's short aliases — the assistant uses
 them exactly as returned; raw Exchange ids never appear.
@@ -173,6 +189,13 @@ send_draft(draft_id="d1", confirm_token="…")
     sends once (tokens are single-use; editing the draft in between
     invalidates the token)
 ```
+
+Duplicate-sensitive `create_draft` and `create_event` calls accept an
+`idempotency_key`. Retrying the same arguments returns the original result;
+reusing the key with different arguments is a conflict. If a client aborts
+while Exchange is still working, use the returned `operation_id` with
+`get_operation_status` (or inspect recent operations in server status) before
+choosing a new key.
 
 ## Health & operations
 

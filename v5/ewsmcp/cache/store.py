@@ -31,11 +31,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from ..coordination import FileMutex
 from ..normalize import fts_match_expression, normalize_ar
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -94,7 +95,8 @@ CREATE TABLE IF NOT EXISTS events (
     location     TEXT,
     organizer    TEXT,
     is_recurring INTEGER NOT NULL DEFAULT 0,
-    my_response  TEXT
+    my_response  TEXT,
+    show_as      TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_events_start ON events(start_ts);
 CREATE TABLE IF NOT EXISTS tasks (
@@ -170,6 +172,7 @@ class CacheStore:
         except OSError:
             pass
         self._lock = threading.RLock()
+        self._process_lock = FileMutex(self.db_path.with_suffix(".writer.lock"))
         self._writer: Optional[sqlite3.Connection] = None
         self._ensure_schema()
 
@@ -188,7 +191,7 @@ class CacheStore:
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
-        with self._lock:
+        with self._lock, self._process_lock.held(10.0):
             conn = self._writer_conn()
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -213,9 +216,16 @@ class CacheStore:
             conn.close()
 
     def _ensure_schema(self) -> None:
-        with self._lock:
+        with self._lock, self._process_lock.held(10.0):
             conn = self._writer_conn()
             conn.executescript(_SCHEMA)
+            # Additive migration for mirrors created by 4.5.0a1. SQLite has
+            # no ``ADD COLUMN IF NOT EXISTS`` on all supported versions.
+            event_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "show_as" not in event_columns:
+                conn.execute("ALTER TABLE events ADD COLUMN show_as TEXT")
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema', ?)",
                 (str(_SCHEMA_VERSION),),
@@ -322,17 +332,55 @@ class CacheStore:
         with self._write() as conn:
             conn.execute("DELETE FROM events")
             for r in rows:
+                values = dict(r)
+                values.setdefault("show_as", None)
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO events (ews_id, changekey, subject,
                         start_ts, start_iso, end_ts, end_iso, location,
-                        organizer, is_recurring, my_response)
+                        organizer, is_recurring, my_response, show_as)
                     VALUES (:ews_id, :changekey, :subject, :start_ts,
                         :start_iso, :end_ts, :end_iso, :location, :organizer,
-                        :is_recurring, :my_response)
+                        :is_recurring, :my_response, :show_as)
                     """,
-                    r,
+                    values,
                 )
+
+    def upsert_events(self, rows: List[Dict[str, Any]]) -> None:
+        """Write-through one-off creates without replacing the sync window."""
+        if not rows:
+            return
+        with self._write() as conn:
+            for r in rows:
+                values = dict(r)
+                values.setdefault("show_as", None)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO events (ews_id, changekey, subject,
+                        start_ts, start_iso, end_ts, end_iso, location,
+                        organizer, is_recurring, my_response, show_as)
+                    VALUES (:ews_id, :changekey, :subject, :start_ts,
+                        :start_iso, :end_ts, :end_iso, :location, :organizer,
+                        :is_recurring, :my_response, :show_as)
+                    """,
+                    values,
+                )
+
+    def patch_event(self, ews_id: str, fields: Dict[str, Any]) -> None:
+        """Patch supplied mirrored event columns after an EWS update."""
+        allowed = {
+            "subject", "start_ts", "start_iso", "end_ts", "end_iso",
+            "location", "show_as",
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        assignments = ", ".join(f"{key}=?" for key in updates)  # fixed allowlist
+        with self._write() as conn:
+            conn.execute(
+                f"UPDATE events SET {assignments} WHERE ews_id=?",  # noqa: S608
+                (*updates.values(), ews_id),
+            )
 
     def upsert_tasks(self, rows: List[Dict[str, Any]]) -> None:
         if not rows:
@@ -538,14 +586,23 @@ class CacheStore:
             ).fetchall()
         return int(total), rows
 
+    def event_page(self, start_ts: int, end_ts: int, offset: int = 0,
+                   limit: int = 25) -> Tuple[List[sqlite3.Row], int]:
+        with self._read() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM events WHERE start_ts < ? AND end_ts > ?",
+                (int(end_ts), int(start_ts)),
+            ).fetchone()["c"]
+            rows = conn.execute(
+                "SELECT * FROM events WHERE start_ts < ? AND end_ts > ? "
+                "ORDER BY start_ts ASC, end_ts ASC, ews_id ASC LIMIT ? OFFSET ?",
+                (int(end_ts), int(start_ts), int(limit), int(offset)),
+            ).fetchall()
+        return rows, int(total)
+
     def events_window(self, start_ts: int, end_ts: int,
                       limit: int = 25) -> List[sqlite3.Row]:
-        with self._read() as conn:
-            return conn.execute(
-                "SELECT * FROM events WHERE start_ts < ? AND end_ts > ? "
-                "ORDER BY start_ts ASC LIMIT ?",
-                (int(end_ts), int(start_ts), int(limit)),
-            ).fetchall()
+        return self.event_page(start_ts, end_ts, 0, limit)[0]
 
     def folder_rows(self) -> List[sqlite3.Row]:
         with self._read() as conn:

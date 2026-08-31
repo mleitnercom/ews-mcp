@@ -38,4 +38,7 @@ def parse_when(value, field: str, tz_name: str) -> datetime:
             "validation", f"{field!r}: cannot parse {value!r} as a date.",
             hint=GRAMMAR_HINT,
         ) from None
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=tz)
+    # Fixed-offset ISO values (``+02:00``, ``+01:00`` and ``Z``) must be
+    # converted to the named server zone.  Passing datetime.timezone directly
+    # into exchangelib makes it derive invalid keys such as ``UTC+02:00``.
+    return dt.astimezone(tz) if dt.tzinfo is not None else dt.replace(tzinfo=tz)

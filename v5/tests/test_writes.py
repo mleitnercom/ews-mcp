@@ -11,6 +11,7 @@ drift would fail here first.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Dict
@@ -18,11 +19,12 @@ from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import make_settings
 from exchangelib import OofSettings
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
 
-from conftest import make_settings
 from ewsmcp.audit import AuditLog
+from ewsmcp.cache.store import CacheStore
 from ewsmcp.ids import get_aliaser
 from ewsmcp.tools import writes
 from ewsmcp.tools.base import Context, dispatch
@@ -569,6 +571,127 @@ def test_update_event_notify_blocked_by_kill_switch(tmp_path):
     p2 = call(ctx, "update_event", {**kwargs, "confirm_token": p1["confirm_token"]})
     assert p2["error"]["code"] == "kill_switch"
     ev.save.assert_not_called()
+
+
+def test_create_and_update_event_working_elsewhere(tmp_path, monkeypatch):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    ctx.cache = CacheStore(tmp_path / "mirror.db")
+    monkeypatch.setattr(writes, "CalendarItem", FakeCalendarItem)
+    created = call(ctx, "create_event", {
+        "subject": "Home Office", "start": "2026-09-04T08:00:00+02:00",
+        "end": "2026-09-04T17:00:00+02:00", "show_as": "working_elsewhere",
+    })
+    assert created["ok"] is True and created["show_as"] == "working_elsewhere"
+    assert FakeCalendarItem.last.legacy_free_busy_status == "WorkingElsewhere"
+    cached = ctx.cache.events_window(0, 2**40)[0]
+    assert cached["show_as"] == "working_elsewhere"
+
+    ev = MagicMock()
+    account._by_id["RAW-NEW-EVENT"] = ev
+    updated = call(ctx, "update_event", {
+        "event_id": created["event_id"], "show_as": "busy",
+    })
+    assert updated["updated_fields"] == ["legacy_free_busy_status"]
+    assert ev.legacy_free_busy_status == "Busy"
+    assert ctx.cache.events_window(0, 2**40)[0]["show_as"] == "busy"
+
+
+def test_create_event_invalid_show_as_is_validation(tmp_path, monkeypatch):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    monkeypatch.setattr(writes, "CalendarItem", FakeCalendarItem)
+    result = call(ctx, "create_event", {
+        "subject": "X", "start": "2026-09-04T08:00", "end": "2026-09-04T09:00",
+        "show_as": "somewhere_over_the_rainbow",
+    })
+    assert result["error"]["code"] == "validation"
+    assert "working_elsewhere" in result["error"]["message"]
+
+
+def test_create_event_idempotency_replays_and_conflicts(tmp_path, monkeypatch):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    monkeypatch.setattr(writes, "CalendarItem", FakeCalendarItem)
+    kwargs = {"subject": "Focus", "start": "2026-09-04T08:00",
+              "end": "2026-09-04T09:00", "idempotency_key": "event-1"}
+    first = call(ctx, "create_event", kwargs)
+    first_item = FakeCalendarItem.last
+    replay = call(ctx, "create_event", kwargs)
+    assert replay["event_id"] == first["event_id"]
+    assert replay["idempotent_replay"] is True
+    assert FakeCalendarItem.last is first_item
+    conflict = call(ctx, "create_event", {**kwargs, "subject": "Different"})
+    assert conflict["error"]["code"] == "idempotency_conflict"
+
+
+def test_meeting_response_reply_all_reconstructs_draft(tmp_path, monkeypatch):
+    account = make_account()
+    account.primary_smtp_address = "exec@corp.example"
+    meeting_response = SimpleNamespace(
+        id="MR-1", subject="Accepted: Planning",
+        sender=SimpleNamespace(email_address="organizer@corp.example"),
+        to_recipients=[SimpleNamespace(email_address="exec@corp.example"),
+                       SimpleNamespace(email_address="peer@corp.example")],
+        cc_recipients=[],
+    )
+    account._by_id["MR-1"] = meeting_response
+    ctx = make_ctx(tmp_path, account)
+    monkeypatch.setattr(writes, "Message", FakeDraftMessage)
+    result = call(ctx, "create_draft", {
+        "mode": "reply_all", "reply_to": "MR-1", "body": "Thanks",
+    })
+    assert result["ok"] is True
+    assert result["fallback"] == "reconstructed_SimpleNamespace"
+    assert FakeDraftMessage.last.kwargs["to_recipients"] == [
+        "organizer@corp.example"]
+    assert FakeDraftMessage.last.kwargs["cc_recipients"] == ["peer@corp.example"]
+
+
+def test_create_draft_idempotency_replays_without_duplicate(tmp_path, monkeypatch):
+    account = make_account()
+    ctx = make_ctx(tmp_path, account)
+    monkeypatch.setattr(writes, "Message", FakeDraftMessage)
+    kwargs = {"to": ["a@corp.example"], "body": "Hello",
+              "idempotency_key": "draft-1"}
+    first = call(ctx, "create_draft", kwargs)
+    first_item = FakeDraftMessage.last
+    replay = call(ctx, "create_draft", kwargs)
+    assert replay["draft_id"] == first["draft_id"]
+    assert replay["idempotent_replay"] is True
+    assert FakeDraftMessage.last is first_item
+
+
+def test_cancelled_create_finishes_and_same_key_replays(tmp_path, monkeypatch):
+    account = make_account()
+
+    class ThreadGateway(FakeGateway):
+        async def call(self, fn):
+            return await asyncio.to_thread(fn, self.account)
+
+    class SlowMessage(FakeDraftMessage):
+        def save(self, **kwargs):
+            time.sleep(0.15)
+            return super().save(**kwargs)
+
+    ctx = make_ctx(tmp_path, account)
+    ctx.gateway = ThreadGateway(account)
+    monkeypatch.setattr(writes, "Message", SlowMessage)
+    kwargs = {"to": ["a@corp.example"], "body": "Hello",
+              "idempotency_key": "cancelled-draft"}
+
+    async def cancel_in_flight():
+        task = asyncio.create_task(dispatch(ctx, SPEC["create_draft"], dict(kwargs)))
+        await asyncio.sleep(0.03)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_in_flight())
+    replay = call(ctx, "create_draft", kwargs)
+    assert replay["ok"] is True
+    assert replay["idempotent_replay"] is True
+    assert replay["operation"]["status"] == "completed"
 
 
 # --- respond_to_event / cancel_event --------------------------------------------

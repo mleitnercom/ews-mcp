@@ -131,6 +131,26 @@ def test_cycle_failure_degrades_not_dies(tmp_path):
     assert engine.status()["last_error"]
 
 
+def test_sync_engine_disables_aggregate_gateway_deadline(tmp_path):
+    class RecordingGateway:
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, fn, *, lane="read", timeout_s=None):
+            self.calls.append((lane, timeout_s))
+            return "ok"
+
+    gateway = RecordingGateway()
+    settings = make_settings(request_timeout=30)
+    store = CacheStore(tmp_path / "mirror.db")
+    engine = SyncEngine(settings, gateway, store)
+
+    result = asyncio.run(engine._gateway_call(lambda _account: None))
+
+    assert result == "ok"
+    assert gateway.calls == [("sync", 0)]
+
+
 def test_row_from_message_cleans_body_once(tmp_path):
     quoted = ("Latest reply only.\n\nFrom: Someone <s@corp.example>\n"
               "Sent: Monday\nTo: Exec\nSubject: Re: X\n\nOLD QUOTED TEXT")

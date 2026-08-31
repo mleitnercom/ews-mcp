@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from .bodyclean import clean_body, html_to_text, strip_quoted_history
+from .calendar_status import from_ews_show_as
 from .ids import IdAliaser
 
 
@@ -70,7 +71,10 @@ def msg_card(item: Any, aliaser: IdAliaser, tz: str) -> Dict[str, Any]:
         text = strip_quoted_history(text)[0] or text
     except Exception:
         pass
-    raw_id = getattr(getattr(item, "id", None), "__str__", lambda: None)() or getattr(item, "id", None)
+    raw_id = (
+        getattr(getattr(item, "id", None), "__str__", lambda: None)()
+        or getattr(item, "id", None)
+    )
     imid = getattr(item, "message_id", None)
     card: Dict[str, Any] = {
         "id": aliaser.alias_for(str(raw_id), "m", internet_message_id=imid) if raw_id else None,
@@ -161,4 +165,7 @@ def event_card(item: Any, aliaser: IdAliaser, tz: str) -> Dict[str, Any]:
         card["my_response"] = str(my_response)
     if getattr(item, "is_recurring", False) or getattr(item, "recurrence", None):
         card["recurring"] = True
+    show_as = from_ews_show_as(getattr(item, "legacy_free_busy_status", None))
+    if show_as:
+        card["show_as"] = show_as
     return card

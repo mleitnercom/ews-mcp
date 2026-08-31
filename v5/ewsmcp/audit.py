@@ -17,12 +17,15 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .coordination import FileMutex
+
 
 class AuditLog:
     def __init__(self, data_dir: str):
         self._dir = Path(data_dir) / "audit"
         self._state_path = self._dir / "chain.state"
         self._lock = threading.Lock()
+        self._process_lock = FileMutex(self._dir / "writer.lock")
         self._prev = "GENESIS"
         self._seq = 0
         try:  # resume the persisted chain head; a fresh dir starts at GENESIS
@@ -52,7 +55,15 @@ class AuditLog:
         if detail:
             entry["detail"] = detail
         try:
-            with self._lock:
+            with self._lock, self._process_lock.held(10.0):
+                # Another process may have advanced the chain since this
+                # instance last wrote. Reload under the shared writer lock.
+                try:
+                    state = json.loads(self._state_path.read_text(encoding="utf-8"))
+                    self._prev = str(state["prev"])
+                    self._seq = int(state["seq"])
+                except Exception:
+                    pass
                 self._seq += 1
                 entry["seq"] = self._seq
                 entry["prev"] = self._prev[:12]

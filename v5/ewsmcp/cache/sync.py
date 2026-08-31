@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from ..bodyclean import clean_body
+from ..calendar_status import from_ews_show_as
 from ..dto import fmt_dt
 from ..gateway.client import WELL_KNOWN
 from .store import CacheStore
@@ -109,6 +110,8 @@ def row_from_event(item: Any, tz: str) -> Dict[str, Any]:
         "is_recurring": 1 if (getattr(item, "is_recurring", False)
                               or getattr(item, "recurrence", None)) else 0,
         "my_response": str(getattr(item, "my_response_type", None) or "") or None,
+        "show_as": from_ews_show_as(
+            getattr(item, "legacy_free_busy_status", None)),
     }
 
 
@@ -128,11 +131,12 @@ def row_from_task(item: Any, tz: str) -> Dict[str, Any]:
 
 class SyncEngine:
     def __init__(self, settings: Any, gateway: Any, store: CacheStore,
-                 semantic: Any = None):
+                 semantic: Any = None, coordinator: Any = None):
         self.settings = settings
         self.gateway = gateway
         self.store = store
         self.semantic = semantic  # optional vector tier; failures degrade
+        self.coordinator = coordinator
         self.folder_keys = [
             k.strip().lower()
             for k in (settings.ews_cache_folders or "").split(",") if k.strip()
@@ -167,12 +171,15 @@ class SyncEngine:
             "last_cycle_age_s": (int(time.time() - self.last_cycle_ts)
                                  if self.last_cycle_ts else None),
             "last_error": self.last_error,
+            "leader": (self.coordinator.is_sync_leader
+                       if self.coordinator is not None else True),
         }
 
     async def _loop(self) -> None:
         while not self._stopped:
             try:
-                await self._cycle()
+                if self.coordinator is None or self.coordinator.try_become_sync_leader():
+                    await self._cycle()
                 self.last_error = None
             except asyncio.CancelledError:
                 raise
@@ -188,11 +195,23 @@ class SyncEngine:
     # --------------------------------------------------------------- cycle
 
     async def _cycle(self) -> None:
-        await self.gateway.call(self._sync_mail_folders)
+        await self._gateway_call(self._sync_mail_folders)
         slow_every = max(60, int(self.settings.ews_cache_hierarchy_seconds))
         if time.time() - self._last_slow_ts >= slow_every:
-            await self.gateway.call(self._sync_slow_lane)
+            await self._gateway_call(self._sync_slow_lane)
             self._last_slow_ts = time.time()
+
+    async def _gateway_call(self, fn: Any) -> Any:
+        # Test gateways and older adapters only accept ``call(fn)``.
+        import inspect
+        if "lane" in inspect.signature(self.gateway.call).parameters:
+            # A sync job performs multiple individually bounded EWS requests.
+            # Applying the single-request timeout to the entire job reports a
+            # false failure after 30s while its isolated worker keeps updating
+            # the mirror in the background.  The sync lane has its own worker
+            # and interprocess lock, so let the complete job drain.
+            return await self.gateway.call(fn, lane="sync", timeout_s=0)
+        return await self.gateway.call(fn)
 
     def _sync_mail_folders(self, account: Any) -> None:
         """Apply item deltas for each hot folder (runs on the EWS pool)."""
@@ -291,6 +310,11 @@ class SyncEngine:
                 [row_from_event(ev, tz) for ev in events
                  if getattr(ev, "id", None)])
             self.store.set_sync_state("events", None, time.time())
+            self.store.set_sync_state("events:start", str(int(day_start.timestamp())),
+                                      time.time())
+            self.store.set_sync_state(
+                "events:end", str(int((day_start + timedelta(
+                    days=CALENDAR_WINDOW_DAYS)).timestamp())), time.time())
         except Exception as exc:
             logger.debug("calendar window sync failed: %s", exc)
 

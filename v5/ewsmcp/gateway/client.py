@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from exchangelib import Account, Configuration, Credentials, DELEGATE, EWSTimeZone
+from exchangelib import DELEGATE, Account, Configuration, Credentials, EWSTimeZone
 from exchangelib.protocol import (
     BaseProtocol,
     CachingProtocol,
@@ -34,14 +34,24 @@ WELL_KNOWN = {
 
 
 class EWSGateway:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, coordinator: Any = None):
         self.settings = settings
+        self.coordinator = coordinator
         self._account: Optional[Account] = None
         self._account_lock = threading.Lock()
         self._pool = ThreadPoolExecutor(
             max_workers=max(1, settings.ews_max_concurrency),
             thread_name_prefix="ews",
         )
+        # Calendar reads, writes and background sync must not starve one
+        # another when exchangelib keeps a cancelled request alive in a
+        # worker.  Each lane has a bounded executor; the coordinator also
+        # enforces the same lane across local processes.
+        self._lane_pools = {
+            "calendar": ThreadPoolExecutor(max_workers=1, thread_name_prefix="ews-calendar"),
+            "write": ThreadPoolExecutor(max_workers=1, thread_name_prefix="ews-write"),
+            "sync": ThreadPoolExecutor(max_workers=1, thread_name_prefix="ews-sync"),
+        }
         self.last_connection_error: Optional[str] = None
         self._folder_cache: Dict[str, Any] = {}
         self._folder_cache_ts = 0.0
@@ -67,8 +77,10 @@ class EWSGateway:
             retry_policy=FaultTolerance(max_wait=s.ews_retry_max_wait_seconds),
         )
         if s.ews_auth_type_force:  # escape hatch for a DIFFERENT Exchange only
-            logger.warning("auth_type FORCED to %s — the primary Exchange requires auto-negotiation",
-                           s.ews_auth_type_force)
+            logger.warning(
+                "auth_type FORCED to %s — the primary Exchange requires auto-negotiation",
+                s.ews_auth_type_force,
+            )
             kwargs["auth_type"] = s.ews_auth_type_force
         config = Configuration(**kwargs)
         return Account(
@@ -121,11 +133,57 @@ class EWSGateway:
 
     # ------------------------------------------------------------- calling
 
-    async def call(self, fn: Callable[[Account], Any]) -> Any:
+    async def call(self, fn: Callable[[Account], Any], *, lane: str = "read",
+                   timeout_s: Optional[float] = None) -> Any:
         """Run blocking EWS work on the bounded pool; the pool size IS the
-        EWS concurrency cap (polite guest on the per-user throttle budget)."""
+        EWS concurrency cap (polite guest on the per-user throttle budget).
+
+        A timed-out asyncio caller does not stop the underlying HTTP request.
+        Separate pools contain that unavoidable Python limitation, while the
+        interprocess lane lock prevents retries from multiplying the load.
+        """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._pool, lambda: fn(self.account))
+        timeout = float(timeout_s if timeout_s is not None else self.settings.request_timeout)
+        # A non-positive explicit timeout disables only the *outer* asyncio
+        # deadline.  This is reserved for isolated background work such as
+        # cache sync, which consists of several bounded EWS requests and can
+        # legitimately take longer than one request timeout in total.  The
+        # exchangelib HTTP timeout and retry policy still bound each upstream
+        # request, and the dedicated sync pool prevents user-facing calls from
+        # being starved.
+        no_outer_deadline = timeout_s is not None and timeout <= 0
+        pool = self._lane_pools.get(lane, self._pool)
+
+        def invoke() -> Any:
+            try:
+                if self.coordinator is None:
+                    return fn(self.account)
+                lock_timeout = (float(self.settings.request_timeout)
+                                if no_outer_deadline else timeout)
+                with self.coordinator.live_call(lane, lock_timeout):
+                    return fn(self.account)
+            except Exception as exc:
+                if self.coordinator is not None:
+                    backoff = self.coordinator.backoff_seconds(exc)
+                    if backoff is not None:
+                        self.coordinator.set_cooldown(
+                            backoff, f"{type(exc).__name__}: {exc}")
+                raise
+
+        future = loop.run_in_executor(pool, invoke)
+        if no_outer_deadline:
+            return await asyncio.shield(future)
+        try:
+            # Shield keeps the executor future alive after caller cancellation;
+            # it will release the interprocess lock when exchangelib returns.
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise ToolError(
+                "upstream_timeout",
+                f"Exchange {lane} call exceeded {int(timeout)} seconds; "
+                "the isolated worker may still finish in the background",
+                retry_after_s=1,
+            ) from None
 
     # ------------------------------------------------------------- folders
 
