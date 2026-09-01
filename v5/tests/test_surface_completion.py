@@ -50,14 +50,14 @@ def _run(ctx, name, **kwargs):
 
 def test_registry_counts_per_tier_and_semantic(tmp_path):
     full = _ctx(tmp_path, ews_capability_tier="full")
-    assert len(full.registry) == 33
+    assert len(full.registry) == 36
     assert "find_similar" not in full.registry  # semantic off by default
     draft = _ctx(tmp_path, ews_capability_tier="draft")
-    assert len(draft.registry) == 27
+    assert len(draft.registry) == 29
     read = _ctx(tmp_path, ews_capability_tier="read")
     assert len(read.registry) == 16
     with_sem = _ctx(tmp_path, semantic=object(), ews_capability_tier="full")
-    assert len(with_sem.registry) == 34
+    assert len(with_sem.registry) == 37
     assert "find_similar" in with_sem.registry
 
 

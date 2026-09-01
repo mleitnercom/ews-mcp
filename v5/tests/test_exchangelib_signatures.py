@@ -21,7 +21,7 @@ together with the pins, never the pins alone.
 import inspect
 
 import pytest
-from exchangelib import Account, CalendarItem, Message, OofSettings
+from exchangelib import Account, CalendarItem, Contact, Message, OofSettings
 from exchangelib.fields import IntegerField
 from exchangelib.folders import Folder
 from exchangelib.folders.collections import FolderCollection
@@ -77,6 +77,9 @@ PINS = {
     Folder.save: ["self", "update_fields"],
     Folder.move: ["self", "to_folder"],
     Folder.delete: ["self", "delete_type"],
+    # --- personal contacts (contact_management)
+    Contact.save: ["self", "update_fields", "conflict_resolution",
+                   "send_meeting_invitations"],
     # --- reliability (gateway)
     FaultTolerance.__init__: ["self", "max_wait"],
 }

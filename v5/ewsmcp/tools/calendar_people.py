@@ -30,6 +30,7 @@ from exchangelib import EWSTimeZone
 
 from .. import __version__
 from ..bodyclean import clean_body, html_to_text
+from ..contacts import enrich_from_contact, personal_contact
 from ..dates import parse_when
 from ..dto import envelope, event_card, fmt_dt
 from ..errors import ToolError
@@ -342,7 +343,8 @@ async def _check_availability(ctx: Context, attendees: List[str], start: str,
     return out
 
 
-def _gal_person(entry: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
+def _gal_person(entry: Any, *, detailed: bool = False
+                ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """(raw_alias_key, person) — GAL has no stable item id, so the email
     itself is the raw key the 'p' alias binds to."""
     mailbox, contact = entry if isinstance(entry, tuple) else (entry, None)
@@ -355,40 +357,12 @@ def _gal_person(entry: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
         "email": email,
         "source": "gal",
     }
-    _enrich_from_contact(person, contact)
+    enrich_from_contact(person, contact, detailed=detailed)
     return email, person
 
 
-def _enrich_from_contact(person: Dict[str, Any], contact: Any) -> None:
-    if contact is None:
-        return
-    title = getattr(contact, "job_title", None)
-    if title:
-        person["title"] = str(title)
-    company = getattr(contact, "company_name", None)
-    if company:
-        person["company"] = str(company)
-    for ph in getattr(contact, "phone_numbers", None) or []:
-        number = getattr(ph, "phone_number", None)
-        if number:
-            person["phone"] = str(number)
-            break
-
-
 def _contact_person(contact: Any) -> Optional[Tuple[str, Dict[str, Any]]]:
-    emails = [getattr(e, "email", None)
-              for e in (getattr(contact, "email_addresses", None) or [])]
-    email = next((e for e in emails if e), None)
-    if not email:
-        return None  # address-less contacts are useless to the secretary
-    raw_key = str(getattr(contact, "id", None) or email)
-    person: Dict[str, Any] = {
-        "name": getattr(contact, "display_name", None) or email,
-        "email": email,
-        "source": "contacts",
-    }
-    _enrich_from_contact(person, contact)
-    return raw_key, person
+    return personal_contact(contact)
 
 
 async def _find_people(ctx: Context, query: str, source: str = "auto",
@@ -488,7 +462,7 @@ async def _get_contact(ctx: Context, id: str) -> Dict[str, Any]:
                     [key], return_full_contact_data=True):
                 if isinstance(entry, Exception):
                     continue
-                built = _gal_person(entry)
+                built = _gal_person(entry, detailed=True)
                 if built:
                     return built
             return None
@@ -496,7 +470,7 @@ async def _get_contact(ctx: Context, id: str) -> Dict[str, Any]:
         item = fetched[0] if fetched else None
         if isinstance(item, Exception):
             raise item
-        return _contact_person(item) if item is not None else None
+        return personal_contact(item, detailed=True) if item is not None else None
 
     person: Optional[Dict[str, Any]] = None
     raw_key = key
@@ -592,7 +566,8 @@ async def _get_operation_status(ctx: Context, operation_id: str) -> Dict[str, An
         public = dict(result)
         operation_kind = operation.get("kind")
         kind = {"create_draft": "d", "create_event": "e",
-                "create_folder": "f"}.get(operation_kind, "x")
+                "create_folder": "f", "create_contact": "p"}.get(
+                    operation_kind, "x")
         public["item_id"] = ctx.aliaser.alias_for(str(public.pop("raw_id")), kind)
         if operation_kind == "create_folder" and isinstance(public.get("row"), dict):
             row = dict(public["row"])

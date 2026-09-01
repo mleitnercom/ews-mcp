@@ -18,7 +18,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ewsmcp.tools import (  # noqa: E402
-    calendar_people, folder_management, mail_read, tasks, writes,
+    calendar_people,
+    contact_management,
+    folder_management,
+    mail_read,
+    tasks,
+    writes,
 )
 from ewsmcp.tools.base import CLASS_TIER  # noqa: E402
 
@@ -36,6 +41,7 @@ def _packs():
         ("tasks / waiting-on", tasks.TOOLS),
         ("writes", writes.TOOLS),
         ("folder management", folder_management.TOOLS),
+        ("contact management", contact_management.TOOLS),
         ("semantic (only when EWS_SEMANTIC_INDEX != none)",
          mail_read.SEMANTIC_TOOLS),
     ]
@@ -52,7 +58,7 @@ def _first_sentence(text: str) -> str:
 
 def build_table() -> str:
     packs = _packs()
-    core = sum(len(t) for _n, t in packs[:5])
+    core = sum(len(t) for _n, t in packs[:6])
     lines = [
         f"**{core} tools** in the default registry "
         f"(+{len(mail_read.SEMANTIC_TOOLS)} with the semantic tier). "

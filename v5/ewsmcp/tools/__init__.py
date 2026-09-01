@@ -1,16 +1,24 @@
-"""Tool registry: 33 tools in five packs (+find_similar when the semantic
+"""Tool registry: 36 tools in six packs (+find_similar when the semantic
 tier is enabled), tier-filtered. The count is asserted by boot smokes and
 the generated docs — change it DELIBERATELY."""
 
 from typing import Dict
 
 from .base import CLASS_TIER, TIER_RANK, Context, ToolSpec
-from . import calendar_people, folder_management, mail_read, tasks, writes
+from . import (
+    calendar_people,
+    contact_management,
+    folder_management,
+    mail_read,
+    tasks,
+    writes,
+)
 
 
 def build_registry(ctx: Context) -> Dict[str, ToolSpec]:
     specs = [*mail_read.TOOLS, *calendar_people.TOOLS, *tasks.TOOLS,
-             *writes.TOOLS, *folder_management.TOOLS]
+             *writes.TOOLS, *folder_management.TOOLS,
+             *contact_management.TOOLS]
     if getattr(ctx, "semantic", None) is not None:
         specs.extend(mail_read.SEMANTIC_TOOLS)
     tier = ctx.settings.ews_capability_tier

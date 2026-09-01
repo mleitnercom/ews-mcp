@@ -16,6 +16,7 @@ HTTP_BY_CODE = {
     "operation_failed": 409,
     "unsupported_item_type": 422,
     "protected_folder": 403,
+    "protected_contact": 403,
     "not_found": 404,
     "throttled": 429,
     "rate_limited": 429,
