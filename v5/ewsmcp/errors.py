@@ -10,10 +10,12 @@ HTTP_BY_CODE = {
     "kill_switch": 403,
     "recipient_blocked": 403,
     "confirm_invalid": 409,
+    "conflict": 409,
     "idempotency_conflict": 409,
     "operation_in_progress": 409,
     "operation_failed": 409,
     "unsupported_item_type": 422,
+    "protected_folder": 403,
     "not_found": 404,
     "throttled": 429,
     "rate_limited": 429,
@@ -69,6 +71,11 @@ def map_exception(exc: Exception) -> ToolError:
         return ToolError(
             "not_found", text,
             hint="The item id is stale (items move). Re-run search_messages and use a fresh id.",
+        )
+    if "errorfolderexists" in lowered:
+        return ToolError(
+            "conflict", text,
+            hint="A sibling folder with that name already exists. List folders and use its id.",
         )
     if "unauthorized" in lowered or "401" in lowered or "invalid credentials" in lowered:
         return ToolError("auth_failed", text, hint="Upstream Exchange rejected our credentials.")

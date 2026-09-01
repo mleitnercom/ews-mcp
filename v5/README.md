@@ -1,7 +1,7 @@
 # ews-mcp 4.5 — Exchange (EWS) as a safe, fast MCP tool surface
 
 An MCP server that turns an on-prem Exchange mailbox into a lean,
-safety-gated tool surface for an LLM assistant: **29 tools**, alias-only
+safety-gated tool surface for an LLM assistant: **33 tools**, alias-only
 ids, token-lean DTOs, a local cache mirror with Arabic-correct full-text
 search, and a two-phase confirm flow that makes autonomous sending
 tamper-evident.
@@ -73,7 +73,7 @@ credentials in `env`. Prefer a file? Copy [`.env.example`](.env.example)
 to `.env` in the directory you launch `ewsmcp` from — it auto-loads.
 
 That is the whole setup. The defaults are safe: capability tier `draft`
-(24 read + draft tools; nothing can send), `SEND_ENABLED=false` until
+(27 read + draft tools; nothing can send), `SEND_ENABLED=false` until
 you flip it, and mail-at-rest (aliases, audit chain, cache) goes to
 `~/.ewsmcp`. The server **refuses cloud-synced folders** for that data —
 if your home directory lives in OneDrive/Dropbox/iCloud, set `DATA_DIR`
@@ -103,6 +103,18 @@ configs.
 - "What's on my calendar this week?" → `list_events`
 - "Block home office as working elsewhere" →
   `create_event(..., show_as="working_elsewhere", send_invitations=false)`
+- "Find the Skribo project folder" →
+  `list_folders(query="Skribo", match="contains")`
+- "Create Board under Projects" →
+  `create_folder(name="Board", parent="Projects", idempotency_key="board-2026")`
+- "Move Board under Archive" →
+  `move_folder(folder="Projects/Board", parent="Archive")`
+
+Folder deletion is deliberately separate: `delete_folder(folder="f7")`
+first returns a preview and confirmation token, then moves the folder to
+Deleted Items only after the confirmed second call. Permanent deletion must
+be requested explicitly; non-empty trees also require
+`allow_non_empty=true`. System folders are never mutable.
 
 Ids like `m3` / `e1` are the server's short aliases — the assistant uses
 them exactly as returned; raw Exchange ids never appear.

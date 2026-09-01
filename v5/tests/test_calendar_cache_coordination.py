@@ -197,6 +197,12 @@ def test_shared_leader_cooldown_and_operation_journal(tmp_path):
         with pytest.raises(ToolError) as conflict:
             two.reserve_operation("create_event", "key-1", {"subject": "B"})
         assert conflict.value.code == "idempotency_conflict"
+
+        assert one.folder_revision() == 0
+        assert one.bump_folder_revision() == 1
+        assert two.folder_revision() == 1
+        assert two.bump_folder_revision() == 2
+        assert one.folder_revision() == 2
     finally:
         one.close()
         two.close()

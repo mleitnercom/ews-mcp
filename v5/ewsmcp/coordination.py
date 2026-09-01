@@ -183,6 +183,41 @@ class ProcessCoordinator:
                 (key, value, time.time()),
             )
 
+    def folder_revision(self) -> int:
+        """Shared generation of the mailbox folder tree.
+
+        Every stdio process has its own exchangelib folder cache.  This value
+        lets one process announce a mutation so the others invalidate their
+        in-memory trees before resolving another folder.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM state WHERE key=?",
+                (f"folder_revision:{self.mailbox}",),
+            ).fetchone()
+        try:
+            return int(row["value"]) if row is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def bump_folder_revision(self) -> int:
+        key = f"folder_revision:{self.mailbox}"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM state WHERE key=?", (key,)
+            ).fetchone()
+            try:
+                revision = int(row["value"]) + 1 if row is not None else 1
+            except (TypeError, ValueError):
+                revision = 1
+            conn.execute(
+                "INSERT OR REPLACE INTO state(key, value, updated) VALUES (?, ?, ?)",
+                (key, str(revision), time.time()),
+            )
+            conn.commit()
+        return revision
+
     def set_cooldown(self, seconds: float, reason: str = "Exchange backoff") -> None:
         until = time.time() + max(0.0, float(seconds))
         self._set_state(

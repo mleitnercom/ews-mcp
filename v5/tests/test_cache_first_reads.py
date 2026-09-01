@@ -66,6 +66,7 @@ def seeded_store(tmp_path):
         "ews_id": "F-IN", "name": "Inbox", "path": "Inbox", "wk": "f:inbox",
         "total": 3, "unread": 1, "children": 0,
     }])
+    store.set_sync_state("folders", None, now)
     return store
 
 
@@ -134,6 +135,7 @@ def test_list_folders_from_mirror(tmp_path):
     ctx = _ctx(tmp_path, NoTouchGateway())
     res = _run(ctx, "list_folders")
     assert res["source"] == "cache"
+    assert res["as_of"]
     assert res["items"][0]["wk"] == "f:inbox"
     assert res["items"][0]["unread"] == 1
 

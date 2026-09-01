@@ -75,13 +75,14 @@ def main() -> int:
         tools = health.get("tools", 0)
         if status != 200:
             failures.append(f"/health {status}")
-        # 28 = 6 mail-read + 7 calendar/people + 3 tasks + 12 writes with the
+        # 33 = 6 mail-read + 8 calendar/people + 3 tasks + 12 writes + 4
+        # folder-management tools with the
         # default EWS_SEMANTIC_INDEX=none (find_similar unregistered). Update
         # DELIBERATELY together with the generated docs.
-        if tier == "full" and tools != 28:
-            failures.append(f"expected 28 tools in full tier, got {tools}")
-        if tier == "draft" and tools >= 28:
-            failures.append(f"tier=draft should shrink registry, got {tools}")
+        if tier == "full" and tools != 33:
+            failures.append(f"expected 33 tools in full tier, got {tools}")
+        if tier == "draft" and tools != 27:
+            failures.append(f"expected 27 tools in draft tier, got {tools}")
 
         status, ready = _req("GET", "/readyz")
         if status != 503 or ready.get("connection", {}).get("state") != "connecting":

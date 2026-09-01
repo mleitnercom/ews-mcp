@@ -27,6 +27,7 @@ from ..errors import ToolError
 logger = logging.getLogger(__name__)
 
 WELL_KNOWN = {
+    "f:root": "msg_folder_root",
     "f:inbox": "inbox", "f:sent": "sent", "f:drafts": "drafts",
     "f:trash": "trash", "f:junk": "junk", "f:outbox": "outbox",
     "f:calendar": "calendar", "f:contacts": "contacts", "f:tasks": "tasks",
@@ -55,6 +56,7 @@ class EWSGateway:
         self.last_connection_error: Optional[str] = None
         self._folder_cache: Dict[str, Any] = {}
         self._folder_cache_ts = 0.0
+        self._folder_revision_seen: Optional[int] = None
         if settings.ews_insecure_skip_verify:
             BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
             logger.warning("TLS verification DISABLED for Exchange traffic")
@@ -113,6 +115,7 @@ class EWSGateway:
             logger.debug("protocol cache clear failed: %s", e)
         self._folder_cache.clear()
         self._folder_cache_ts = 0.0
+        self._folder_revision_seen = None
 
     def test_connection(self) -> bool:
         """Real network probe — must round-trip on EVERY call.
@@ -187,8 +190,39 @@ class EWSGateway:
 
     # ------------------------------------------------------------- folders
 
+    def prepare_folder_tree(self, account: Account) -> None:
+        """Invalidate this process's tree after a mutation in another one."""
+        coordinator = self.coordinator
+        if coordinator is None or not hasattr(coordinator, "folder_revision"):
+            return
+        revision = int(coordinator.folder_revision())
+        if self._folder_revision_seen is None:
+            self._folder_revision_seen = revision
+            return
+        if revision == self._folder_revision_seen:
+            return
+        try:
+            account.msg_folder_root.clear_cache()
+        except Exception as exc:
+            logger.debug("exchangelib folder cache clear failed: %s", exc)
+        self._folder_cache.clear()
+        self._folder_cache_ts = 0.0
+        self._folder_revision_seen = revision
+
+    def mark_folder_tree_changed(self, account: Optional[Account] = None) -> int:
+        """Publish a local folder mutation to every process sharing DATA_DIR."""
+        self._folder_cache.clear()
+        self._folder_cache_ts = 0.0
+        coordinator = self.coordinator
+        if coordinator is not None and hasattr(coordinator, "bump_folder_revision"):
+            revision = int(coordinator.bump_folder_revision())
+            self._folder_revision_seen = revision
+            return revision
+        return 0
+
     def _folder_map(self, account: Account) -> Dict[str, Any]:
         """{raw_id|lower_path: Folder} cache, rebuilt every 300s (sync)."""
+        self.prepare_folder_tree(account)
         now = time.time()
         if self._folder_cache and now - self._folder_cache_ts < 300:
             return self._folder_cache
@@ -213,6 +247,7 @@ class EWSGateway:
 
     def resolve_folder(self, account: Account, ref: Optional[str], aliaser) -> Any:
         """well-known alias | folder alias (f12) | path | raw id → Folder (sync)."""
+        self.prepare_folder_tree(account)
         if not ref:
             return account.inbox
         key = ref.strip()

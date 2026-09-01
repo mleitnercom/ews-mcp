@@ -195,6 +195,7 @@ def test_slow_lane_syncs_folders_calendar_tasks(tmp_path):
     engine._sync_slow_lane(account)
     folders = {r["path"]: r for r in store.folder_rows()}
     assert folders["Inbox"]["unread"] == 2
+    assert store.watermark("folders") is not None
     assert store.events_window(0, 2**40)
     rows, total = store.task_rows()
     assert total == 1

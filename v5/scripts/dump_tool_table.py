@@ -17,7 +17,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ewsmcp.tools import calendar_people, mail_read, tasks, writes  # noqa: E402
+from ewsmcp.tools import (  # noqa: E402
+    calendar_people, folder_management, mail_read, tasks, writes,
+)
 from ewsmcp.tools.base import CLASS_TIER  # noqa: E402
 
 API_MD = Path(__file__).resolve().parents[1] / "docs" / "API.md"
@@ -33,6 +35,7 @@ def _packs():
         ("calendar / people / status", calendar_people.TOOLS),
         ("tasks / waiting-on", tasks.TOOLS),
         ("writes", writes.TOOLS),
+        ("folder management", folder_management.TOOLS),
         ("semantic (only when EWS_SEMANTIC_INDEX != none)",
          mail_read.SEMANTIC_TOOLS),
     ]
@@ -49,7 +52,7 @@ def _first_sentence(text: str) -> str:
 
 def build_table() -> str:
     packs = _packs()
-    core = sum(len(t) for _n, t in packs[:4])
+    core = sum(len(t) for _n, t in packs[:5])
     lines = [
         f"**{core} tools** in the default registry "
         f"(+{len(mail_read.SEMANTIC_TOOLS)} with the semantic tier). "

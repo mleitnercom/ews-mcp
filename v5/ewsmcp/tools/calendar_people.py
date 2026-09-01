@@ -590,8 +590,14 @@ async def _get_operation_status(ctx: Context, operation_id: str) -> Dict[str, An
     result = operation.get("result")
     if isinstance(result, dict) and result.get("raw_id"):
         public = dict(result)
-        kind = "d" if operation.get("kind") == "create_draft" else "e"
+        operation_kind = operation.get("kind")
+        kind = {"create_draft": "d", "create_event": "e",
+                "create_folder": "f"}.get(operation_kind, "x")
         public["item_id"] = ctx.aliaser.alias_for(str(public.pop("raw_id")), kind)
+        if operation_kind == "create_folder" and isinstance(public.get("row"), dict):
+            row = dict(public["row"])
+            row["id"] = ctx.aliaser.alias_for(str(row.pop("ews_id")), "f")
+            public["row"] = row
         operation = {**operation, "result": public}
     return {"ok": True, "operation": operation}
 

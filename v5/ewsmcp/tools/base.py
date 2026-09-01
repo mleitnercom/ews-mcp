@@ -62,7 +62,8 @@ class ToolSpec:
     # so an update_draft between preview and confirm invalidates the token
     # (TOCTOU defense), and the resolved recipients pass the recipient
     # guard. Reserved key "body_text" is hashed in full but previewed as a
-    # snippet.
+    # snippet. Non-message previews may instead supply an internal
+    # ``_confirm_binding`` object, which is hashed but never returned.
     preview: Optional[Callable[[Any, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None
 
     def confirm_needed(self, kwargs: Dict[str, Any]) -> bool:
@@ -163,6 +164,31 @@ _CONFIRM_HINTS = {
 }
 
 
+def _preview_content_hash(content: Dict[str, Any]) -> str:
+    """Hash resolved preview content, including non-message resources.
+
+    Mail tools retain their subject/recipient/body binding.  Other resource
+    previews may provide an internal ``_confirm_binding`` object (for example
+    a folder id, changekey, path and subtree counts) without exposing that
+    implementation field in the public preview.
+    """
+    if "_confirm_binding" in content:
+        return content_hash(content["_confirm_binding"])
+    body_text = content.get("body_text")
+    return content_hash(
+        content.get("subject") or "",
+        sorted(content.get("to") or []),
+        sorted(content.get("cc") or []),
+        sorted(content.get("bcc") or []),
+        body_text if isinstance(body_text, str) else "",
+    )
+
+
+def _confirm_target_id(kwargs: Dict[str, Any]) -> str:
+    return str(kwargs.get("draft_id") or kwargs.get("event_id")
+               or kwargs.get("id") or kwargs.get("folder") or "-")
+
+
 async def _confirm_gate(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
                         token: Optional[str]) -> Optional[Dict[str, Any]]:
     """Returns the phase-1 response, or None when execution may proceed.
@@ -177,16 +203,8 @@ async def _confirm_gate(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
     if spec.preview is not None:
         content = await spec.preview(ctx, dict(kwargs))
         _recipient_guard(ctx, content)  # the draft's REAL recipients
-        body_text = content.get("body_text")
-        chash = content_hash(
-            content.get("subject") or "",
-            sorted(content.get("to") or []),
-            sorted(content.get("cc") or []),
-            sorted(content.get("bcc") or []),
-            body_text if isinstance(body_text, str) else "",
-        )
-        target_id = str(kwargs.get("draft_id") or kwargs.get("event_id")
-                        or kwargs.get("id") or "-")
+        chash = _preview_content_hash(content)
+        target_id = _confirm_target_id(kwargs)
     else:
         chash = content_hash(dict(kwargs))
         target_id = "-"
@@ -196,7 +214,8 @@ async def _confirm_gate(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
             chash=chash, ttl_seconds=ctx.settings.confirm_ttl_seconds, secret=secret,
         )
         if content is not None:
-            preview = {k: v for k, v in content.items() if k != "body_text"}
+            preview = {k: v for k, v in content.items()
+                       if k not in ("body_text", "_confirm_binding")}
             body_text = content.get("body_text")
             if isinstance(body_text, str):
                 preview["body_snippet"] = body_text[:1000]
@@ -242,16 +261,8 @@ async def mint_token(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any]) -> st
     """
     if spec.preview is not None:
         content = await spec.preview(ctx, dict(kwargs))
-        body_text = content.get("body_text")
-        chash = content_hash(
-            content.get("subject") or "",
-            sorted(content.get("to") or []),
-            sorted(content.get("cc") or []),
-            sorted(content.get("bcc") or []),
-            body_text if isinstance(body_text, str) else "",
-        )
-        target_id = str(kwargs.get("draft_id") or kwargs.get("event_id")
-                        or kwargs.get("id") or "-")
+        chash = _preview_content_hash(content)
+        target_id = _confirm_target_id(kwargs)
     else:
         chash = content_hash(dict(kwargs))
         target_id = "-"
@@ -370,7 +381,7 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
         if spec.side_effect_class in ("send", "destructive"):
             detail = {k: kwargs.get(k)
                       for k in ("to", "cc", "subject", "id", "ids",
-                                "draft_id", "event_id")
+                                "draft_id", "event_id", "folder", "disposition")
                       if kwargs.get(k) is not None}
         # Audit writes (file append + chain hash) run off the event loop —
         # one slow disk must not stall every concurrent request.

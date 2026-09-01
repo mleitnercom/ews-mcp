@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 from ..bodyclean import clean_body
 from ..calendar_status import from_ews_show_as
 from ..dto import fmt_dt
-from ..gateway.client import WELL_KNOWN
+from ..folders import collect_folder_rows
 from .store import CacheStore
 
 logger = logging.getLogger(__name__)
@@ -263,37 +263,12 @@ class SyncEngine:
         """Folder tree + expanded calendar window + tasks (every ~10 min)."""
         tz = self.settings.ews_tz
         # Folder tree with fresh counts — the frozen-counts fix.
-        rows: List[Dict[str, Any]] = []
-        wk_by_raw: Dict[str, str] = {}
-        for wk_alias, attr in WELL_KNOWN.items():
-            try:
-                fid = getattr(getattr(account, attr, None), "id", None)
-                if fid:
-                    wk_by_raw.setdefault(fid, wk_alias)
-            except Exception:
-                continue
-
-        def walk(folder: Any, prefix: str) -> None:
-            for child in list(getattr(folder, "children", None) or []):
-                name = getattr(child, "name", "") or ""
-                path = f"{prefix}/{name}" if prefix else name
-                raw_id = getattr(child, "id", None)
-                if raw_id:
-                    rows.append({
-                        "ews_id": str(raw_id),
-                        "name": name,
-                        "path": path,
-                        "wk": wk_by_raw.get(raw_id),
-                        "total": getattr(child, "total_count", None) or 0,
-                        "unread": getattr(child, "unread_count", None) or 0,
-                        "children": len(list(getattr(child, "children", None) or [])),
-                    })
-                walk(child, path)
-
         try:
-            walk(account.msg_folder_root, "")
-            if rows:
-                self.store.replace_folders(rows)
+            if hasattr(self.gateway, "prepare_folder_tree"):
+                self.gateway.prepare_folder_tree(account)
+            rows = collect_folder_rows(account)
+            self.store.replace_folders(rows)
+            self.store.set_sync_state("folders", None, time.time())
         except Exception as exc:
             logger.debug("folder tree sync failed: %s", exc)
 

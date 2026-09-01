@@ -27,7 +27,8 @@ from ..bodyclean import clean_body
 from ..dates import parse_when
 from ..dto import envelope, event_card, fmt_dt, msg_card, msg_full
 from ..errors import ToolError
-from ..gateway.client import WELL_KNOWN, paginate
+from ..folders import collect_folder_rows
+from ..gateway.client import paginate
 from .base import Context, ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -234,9 +235,31 @@ def _is_texty(name: str, content_type: Optional[str]) -> bool:
 
 
 async def _list_folders(ctx: Context, parent: Optional[str] = None, depth: int = 2,
-                        include_empty: bool = True,
+                        include_empty: bool = True, query: Optional[str] = None,
+                        match: str = "contains",
                         fresh: bool = False) -> Dict[str, Any]:
     depth = max(1, min(int(depth), 5))
+    if match not in ("contains", "exact"):
+        raise ToolError("validation", "match must be 'contains' or 'exact'")
+    needle = (query or "").strip().casefold()
+    if query is not None and not needle:
+        raise ToolError("validation", "query cannot be empty")
+    # A search is expected to find deeply nested folders without first
+    # knowing their depth.  Plain tree listings retain the caller's bound.
+    effective_depth = 5 if needle else depth
+
+    def wanted(row: Any) -> bool:
+        if (str(row["path"] or "").count("/") + 1) > effective_depth:
+            return False
+        if not include_empty and not row["total"]:
+            return False
+        if not needle:
+            return True
+        name = str(row["name"] or "").casefold()
+        path = str(row["path"] or "").casefold()
+        if match == "exact":
+            return needle in (name, path)
+        return needle in name or needle in path
 
     # ---- mirror (the hierarchy lane refreshes counts every ~10 min) --------
     if not fresh and parent is None and ctx.cache is not None:
@@ -248,9 +271,7 @@ async def _list_folders(ctx: Context, parent: Optional[str] = None, depth: int =
         if folder_rows:
             rows = []
             for r in folder_rows:
-                if (r["path"] or "").count("/") + 1 > depth:
-                    continue
-                if not include_empty and not r["total"]:
+                if not wanted(r):
                     continue
                 row: Dict[str, Any] = {
                     "id": ctx.aliaser.alias_for(r["ews_id"], "f"),
@@ -261,48 +282,28 @@ async def _list_folders(ctx: Context, parent: Optional[str] = None, depth: int =
                 if r["wk"]:
                     row["wk"] = r["wk"]
                 rows.append(row)
-            as_of = ctx.cache.watermark("events")  # slow-lane watermark
+            as_of = ctx.cache.watermark("folders")
             return _stamp(envelope(rows, total_available=len(rows), offset=0),
                           "cache", as_of)
 
     def work(account: Any) -> List[Dict[str, Any]]:
+        if hasattr(ctx.gateway, "prepare_folder_tree"):
+            ctx.gateway.prepare_folder_tree(account)
         root = (ctx.gateway.resolve_folder(account, parent, ctx.aliaser)
                 if parent else account.msg_folder_root)
-        wk_by_raw_id: Dict[Any, str] = {}
-        for wk_alias, attr in WELL_KNOWN.items():
-            try:  # best effort — wk tagging must never break the walk
-                fid = getattr(getattr(account, attr, None), "id", None)
-                if fid:
-                    wk_by_raw_id.setdefault(fid, wk_alias)
-            except Exception:
-                continue
         rows: List[Dict[str, Any]] = []
-
-        def walk(folder: Any, level: int, prefix: str) -> None:
-            if level > depth:
-                return
-            for child in list(getattr(folder, "children", None) or []):
-                name = getattr(child, "name", "") or ""
-                path = f"{prefix}/{name}" if prefix else name
-                total = getattr(child, "total_count", None) or 0
-                raw_id = getattr(child, "id", None)
-                grandchildren = list(getattr(child, "children", None) or [])
-                if include_empty or total:
-                    row: Dict[str, Any] = {
-                        "id": ctx.aliaser.alias_for(str(raw_id), "f") if raw_id else None,
-                        "name": name,
-                        "path": path,
-                        "total": total,
-                        "unread": getattr(child, "unread_count", None) or 0,
-                        "children": len(grandchildren),
-                    }
-                    wk = wk_by_raw_id.get(raw_id)
-                    if wk:
-                        row["wk"] = wk
-                    rows.append(row)
-                walk(child, level + 1, path)
-
-        walk(root, 1, "")
+        for raw in collect_folder_rows(account, root):
+            if not wanted(raw):
+                continue
+            row: Dict[str, Any] = {
+                "id": ctx.aliaser.alias_for(raw["ews_id"], "f"),
+                "name": raw["name"], "path": raw["path"],
+                "total": raw["total"], "unread": raw["unread"],
+                "children": raw["children"],
+            }
+            if raw["wk"]:
+                row["wk"] = raw["wk"]
+            rows.append(row)
         return rows
 
     rows = await ctx.gateway.call(work)
@@ -847,8 +848,10 @@ TOOLS: List[ToolSpec] = [
             "{id, name, path, total, unread, children}; `id` is a short folder "
             "alias (f7) reusable as a `folder`/`parent` argument anywhere. "
             "Well-known folders also carry `wk` (e.g. 'f:inbox') — prefer "
-            "passing that stable alias. Set include_empty=false to hide "
-            "folders with zero items."
+            "passing that stable alias; `f:root` addresses the mailbox root. "
+            "Set include_empty=false to hide folders with zero items. Optional "
+            "query searches names and paths case-insensitively through five "
+            "levels, independent of the normal depth display bound."
         ),
         side_effect_class="read",
         requires_ews=True,
@@ -861,6 +864,15 @@ TOOLS: List[ToolSpec] = [
             },
             "depth": {"type": "integer", "minimum": 1, "maximum": 5, "default": 2},
             "include_empty": {"type": "boolean", "default": True},
+            "query": {
+                "type": "string", "minLength": 1, "maxLength": 255,
+                "description": "Optional case-insensitive folder name/path search.",
+            },
+            "match": {
+                "type": "string", "enum": ["contains", "exact"],
+                "default": "contains",
+                "description": "How query is matched against name and path.",
+            },
             "fresh": dict(_FRESH_PROPERTY),
         }),
         handler=_list_folders,

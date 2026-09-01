@@ -73,6 +73,10 @@ PINS = {
                         "max_changes_returned", "sync_scope"],
     Folder.sync_hierarchy: ["self", "sync_state", "only_fields"],
     Folder.refresh: ["self"],
+    # --- folder management (folder_management)
+    Folder.save: ["self", "update_fields"],
+    Folder.move: ["self", "to_folder"],
+    Folder.delete: ["self", "delete_type"],
     # --- reliability (gateway)
     FaultTolerance.__init__: ["self", "max_wait"],
 }

@@ -104,6 +104,7 @@ def _account(inbox=None, sent=None):
 
 def _ctx(tmp_path, account, **overrides):
     overrides.setdefault("data_dir", str(tmp_path / "data"))
+    overrides.setdefault("ews_tz", "Asia/Riyadh")
     return Context(
         settings=make_settings(**overrides),
         gateway=_FakeGateway(account),
@@ -508,3 +509,28 @@ def test_list_folders_depth_and_include_empty(tmp_path):
     ctx = _ctx(tmp_path, account)
     res = _run(ctx, "list_folders", depth=1, include_empty=False)
     assert [row["name"] for row in res["items"]] == ["Inbox"]
+
+
+def test_list_folders_query_searches_deep_names_and_paths(tmp_path):
+    leaf = _folder("FLD-LEAF=", "Board Papers", total=2)
+    year = _folder("FLD-YEAR=", "2026", children=[leaf])
+    projects = _folder("FLD-PROJECTS=", "Projects", children=[year])
+    account = _account()
+    account.msg_folder_root = _folder("FLD-ROOT=", "root", children=[projects])
+    ctx = _ctx(tmp_path, account)
+
+    contains = _run(ctx, "list_folders", query="board")
+    assert [row["path"] for row in contains["items"]] == [
+        "Projects/2026/Board Papers"]
+
+    exact = _run(ctx, "list_folders", query="projects/2026/board papers",
+                 match="exact")
+    assert len(exact["items"]) == 1
+
+
+def test_list_folders_query_validation(tmp_path):
+    account = _account()
+    account.msg_folder_root = _folder("FLD-ROOT=", "root")
+    ctx = _ctx(tmp_path, account)
+    assert _run(ctx, "list_folders", query="")["error"]["code"] == "validation"
+    assert _run(ctx, "list_folders", match="prefix")["error"]["code"] == "validation"

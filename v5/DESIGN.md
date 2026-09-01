@@ -9,7 +9,7 @@ below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Cach
    safety gates. Judgment — summaries, briefings, prioritization,
    commitments, voice — belongs to the CALLING assistant. The server never
    makes an LLM call and never ships a "judgment tool". Tool count stays
-   lean (≤ 29) and is generated into the docs, never hand-counted.
+   lean (≤ 33) and is generated into the docs, never hand-counted.
 2. **Indexing = SQLite + FTS5 in core.** The optional semantic tier hides
    behind an adapter (`EWS_SEMANTIC_INDEX=none|pgvector`, default `none`);
    the public server runs with zero dependencies beyond Exchange
@@ -30,7 +30,7 @@ below (§Tools, §Safety, §Ids, §DTOs, §Errors, §Transports, §Audit, §Cach
 
 ## §Tools — the surface
 
-Four packs (see the generated table in `docs/API.md`):
+Five packs (see the generated table in `docs/API.md`):
 
 - **mail-read** (6): `list_folders`, `search_messages`, `get_message`,
   `get_thread`, `get_attachment`, `get_mailbox_overview`.
@@ -42,6 +42,8 @@ Four packs (see the generated table in `docs/API.md`):
   `delete_draft`, `send_draft`), bulk ops (`update_messages`,
   `move_messages`, `delete_messages`), calendar writes (`create_event`,
   `update_event`, `respond_to_event`, `cancel_event`), `set_oof`.
+- **folder management** (4): `create_folder`, `rename_folder`,
+  `move_folder`, `delete_folder`.
 - **semantic** (+1, only when enabled): `find_similar`.
 
 Every list-shaped result ships exactly the canonical envelope
@@ -69,8 +71,11 @@ without two model decisions):
   token. Tokens are single-use; idempotent replays (same
   `idempotency_key` + draft) return the cached receipt without a fresh
   token — that is what makes retry-after-timeout safe (Stripe semantics).
+  `delete_folder` binds the token to the resolved folder id, changekey,
+  path, subtree counts and requested disposition.
 - **Send rate cap** `EWS_MAX_SENDS_PER_HOUR`.
-- **Durable create idempotency**: `create_draft` and `create_event` journal
+- **Durable create idempotency**: `create_draft`, `create_event` and
+  `create_folder` journal
   queued/running/rate_limited/completed/failed/unknown outcomes in
   `DATA_DIR/coordination/control.db`. The worker, not the cancellable MCP
   coroutine, records completion.
@@ -130,11 +135,17 @@ mirror and audit have explicit interprocess single-writer locks. A single
 shared HTTP process is the recommended endpoint topology when multiple
 assistants are permanent.
 
+Folder mutations additionally bump a mailbox-scoped `folder_revision` in
+`control.db`, immediately replace the shared folder mirror, and make every
+other process clear its private exchangelib folder tree before the next live
+folder resolution.
+
 ## §Errors — a taxonomy, not tracebacks
 
-`validation | auth_failed | tier_blocked | kill_switch |
-recipient_blocked | confirm_invalid | idempotency_conflict | operation_in_progress |
-operation_failed | unsupported_item_type | not_found | throttled | rate_limited |
+`validation | auth_failed | tier_blocked | kill_switch | protected_folder |
+recipient_blocked | confirm_invalid | conflict | idempotency_conflict |
+operation_in_progress | operation_failed | unsupported_item_type | not_found |
+throttled | rate_limited |
 rate_capped | upstream_timeout | upstream_unavailable | upstream_error | internal` — each with an
 LLM-directed `hint` and `retry_after_s` where meaningful. Handler
 `TypeError`/`ValueError` map to `validation`, never 502.
