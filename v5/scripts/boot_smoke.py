@@ -75,12 +75,12 @@ def main() -> int:
         tools = health.get("tools", 0)
         if status != 200:
             failures.append(f"/health {status}")
-        # 36 = 6 mail-read + 8 calendar/people + 3 tasks + 12 writes + 4
+        # 37 = 6 mail-read + 8 calendar/people + 3 tasks + 13 writes + 4
         # folder-management + 3 contact-management tools with the
         # default EWS_SEMANTIC_INDEX=none (find_similar unregistered). Update
         # DELIBERATELY together with the generated docs.
-        if tier == "full" and tools != 36:
-            failures.append(f"expected 36 tools in full tier, got {tools}")
+        if tier == "full" and tools != 37:
+            failures.append(f"expected 37 tools in full tier, got {tools}")
         if tier == "draft" and tools != 29:
             failures.append(f"expected 29 tools in draft tier, got {tools}")
 

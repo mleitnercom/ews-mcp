@@ -792,6 +792,29 @@ def test_set_oof_narrow_switch_keeps_send_disabled(tmp_path):
     assert account.oof_settings.internal_reply == "I am away"
 
 
+def test_respond_to_event_narrow_switch_keeps_send_disabled(tmp_path):
+    """RESPOND_ENABLED runs the real accept path (which DOES mail the
+    organizer) while send_draft stays shut — and the confirm gate remains."""
+    account = make_account()
+    event = MagicMock()
+    account._by_id["RAW-INVITE"] = event
+    ctx = make_ctx(tmp_path, account, send_enabled=False, respond_enabled=True,
+                   ews_capability_tier="full")
+    alias = ctx.aliaser.alias_for("RAW-INVITE", "e")
+
+    kwargs = {"event_id": alias, "response": "accept"}
+    p1 = call(ctx, "respond_to_event", kwargs)
+    assert p1["requires_confirmation"] is True
+    event.accept.assert_not_called()  # nothing before the second call
+
+    p2 = call(ctx, "respond_to_event", {**kwargs, "confirm_token": p1["confirm_token"]})
+    assert p2["ok"] is True and p2["responded"] == "accept"
+    event.accept.assert_called_once()
+
+    blocked = call(ctx, "send_draft", {"draft_id": "d1"})
+    assert blocked["ok"] is False and blocked["error"]["code"] == "kill_switch"
+
+
 # --- delete_event (own, attendee-less entries) --------------------------------
 
 

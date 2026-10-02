@@ -21,6 +21,14 @@ from ..errors import ToolError, map_exception
 
 TIER_RANK = {"read": 0, "draft": 1, "full": 2}
 CLASS_TIER = {"read": "read", "write": "draft", "send": "full", "destructive": "full"}
+# Narrow escape hatches out of the global send kill-switch: {tool: settings
+# attribute}. Each one lets an operator enable exactly ONE send-class tool
+# without opening mail sending as a whole. SEND_ENABLED=true still covers
+# every entry here, so the switches are additive, never a precondition.
+NARROW_SEND_SWITCHES = {
+    "set_oof": "oof_enabled",
+    "respond_to_event": "respond_enabled",
+}
 ID_KEYS = frozenset({
     "id", "message_id", "draft_id", "event_id", "thread_id", "reply_to", "folder",
 })
@@ -299,17 +307,21 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
     confirm_token = kwargs.pop("confirm_token", None)
     try:
         # Kill-switch (policy precedes connectivity)
-        oof_override = spec.name == "set_oof" and ctx.settings.oof_enabled
+        narrow_switch = NARROW_SEND_SWITCHES.get(spec.name)
+        narrow_override = bool(
+            narrow_switch and getattr(ctx.settings, narrow_switch, False)
+        )
         if (spec.side_effect_class == "send"
                 and not ctx.settings.send_enabled
-                and not oof_override):
-            if spec.name == "set_oof":
+                and not narrow_override):
+            if narrow_switch:
+                env_name = narrow_switch.upper()
                 message = (
-                    "set_oof is blocked: SEND_ENABLED=false and "
-                    "OOF_ENABLED=false on this server."
+                    f"{spec.name} is blocked: SEND_ENABLED=false and "
+                    f"{env_name}=false on this server."
                 )
                 hint = (
-                    "Have the operator flip OOF_ENABLED (narrow) or "
+                    f"Have the operator flip {env_name} (narrow) or "
                     "SEND_ENABLED (global)."
                 )
             else:

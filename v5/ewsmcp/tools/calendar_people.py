@@ -545,6 +545,9 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
         "oof_kill_switch": not (
             ctx.settings.oof_enabled or ctx.settings.send_enabled
         ),
+        "respond_kill_switch": not (
+            ctx.settings.respond_enabled or ctx.settings.send_enabled
+        ),
         "tools": len(ctx.registry),
         "counters": dict(ctx.counters),
         "alias_stats": ctx.aliaser.stats(),
@@ -740,7 +743,8 @@ TOOLS: List[ToolSpec] = [
         name="get_server_status",
         description=(
             "This server's own status: version, uptime, Exchange connection "
-            "state, capability tier, send/OOF kill-switches, tool count, "
+            "state, capability tier, send/OOF/respond kill-switches, tool "
+            "count, "
             "per-tool call counters and alias statistics. Never touches Exchange — "
             "it answers even while the connection is still warming up, so "
             "use it to explain connectivity problems."

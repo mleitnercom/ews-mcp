@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # set_oof without enabling mail sends or meeting responses globally.
     # SEND_ENABLED=true remains sufficient for backwards compatibility.
     oof_enabled: bool = False
+    # Narrow escape hatch for meeting responses.  Accepting or declining an
+    # invitation DOES mail the organizer — this switch only separates that
+    # one message from general mail sending, it does not suppress it.
+    # Two-phase confirm still applies.  SEND_ENABLED=true also covers it.
+    respond_enabled: bool = False
     send_confirm_secret: Optional[str] = None
     confirm_ttl_seconds: int = 600  # ONE default everywhere (== confirm.DEFAULT_TTL_SECONDS)
     ews_recipient_allowlist: str = ""

@@ -23,7 +23,7 @@ the registry is the single source of truth for what exists.
 | `find_people` | read | read | Find people by name or email fragment in the GAL (global address list) and/or the personal contacts folder. |
 | `get_contact` | read | read | Fetch one person in full by id — a p-alias from find_people, a raw contact id, or a plain email address. |
 | `get_oof_settings` | read | read | Read the mailbox out-of-office (automatic reply) settings: state (disabled/enabled/scheduled), the scheduled window when applicable, and the internal/external reply texts (HTML stripped, capped by OOF_TEXT_MAX_CHARS; |
-| `get_server_status` | read | read | This server's own status: version, uptime, Exchange connection state, capability tier, send/OOF kill-switches, tool count, per-tool call counters and alias statistics. |
+| `get_server_status` | read | read | This server's own status: version, uptime, Exchange connection state, capability tier, send/OOF/respond kill-switches, tool count, per-tool call counters and alias statistics. |
 | `get_operation_status` | read | read | Read one durable create-operation journal entry by operation_id. |
 | `list_tasks` | read | read | List Exchange tasks (to-dos), incomplete ones by default. |
 | `update_task` | write | draft | Update ONE task: mark it complete and/or set its due date ('today', '+Nd', YYYY-MM-DD). |
@@ -193,7 +193,7 @@ _No parameters._
 
 #### `get_server_status` — read (min tier: read)
 
-This server's own status: version, uptime, Exchange connection state, capability tier, send/OOF kill-switches, tool count, per-tool call counters and alias statistics. Never touches Exchange — it answers even while the connection is still warming up, so use it to explain connectivity problems.
+This server's own status: version, uptime, Exchange connection state, capability tier, send/OOF/respond kill-switches, tool count, per-tool call counters and alias statistics. Never touches Exchange — it answers even while the connection is still warming up, so use it to explain connectivity problems.
 
 _No parameters._
 
@@ -346,7 +346,7 @@ Send an existing draft (the ONLY way mail leaves this mailbox). Two-phase: the f
 
 #### `respond_to_event` — send (min tier: full)
 
-Accept/tentative/decline a meeting — this SENDS a response to the organizer, so it is two-phase confirmed.
+Accept/tentative/decline a meeting — this SENDS a response to the organizer, so it is two-phase confirmed. Needs SEND_ENABLED=true, or RESPOND_ENABLED=true as the narrow switch for responses alone.
 
 > Two-phase confirm: the first call returns a preview + `confirm_token`; repeat the call with the token to execute.
 

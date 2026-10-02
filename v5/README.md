@@ -183,6 +183,7 @@ docker run --rm -p 8000:8000 --env-file .env -v ewsmcp-data:/data ews-mcp:dev
 | `EWS_CAPABILITY_TIER` | `draft` | `read` ⊂ `draft` ⊂ `full` — above-tier tools are unregistered AND refused |
 | `SEND_ENABLED` | `false` | Global send kill-switch (blocks every send-class tool) |
 | `OOF_ENABLED` | `false` | Narrow override for `set_oof`; does not enable other send-class tools |
+| `RESPOND_ENABLED` | `false` | Narrow override for `respond_to_event`; the response is still mailed to the organizer |
 | `OOF_TEXT_MAX_CHARS` | `4000` | Maximum plain-text characters returned for each internal/external OOF reply |
 | `EWS_RECIPIENT_ALLOWLIST` / `EWS_RECIPIENT_DENYLIST` | — | Glob lists enforced on argument-borne AND draft-resolved recipients |
 | `EWS_MAX_SENDS_PER_HOUR` | `10` | Send rate cap |

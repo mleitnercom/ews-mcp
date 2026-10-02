@@ -60,8 +60,10 @@ without two model decisions):
     two-phase confirm → send rate cap → alias resolution → handler → audit
 
 - **Kill-switch** `SEND_ENABLED=false` (default) refuses every send-class
-  call before anything else, except `set_oof` when the narrower
-  `OOF_ENABLED=true` override is set.
+  call before anything else, except for the narrow per-tool overrides in
+  `NARROW_SEND_SWITCHES`: `set_oof` with `OOF_ENABLED=true` and
+  `respond_to_event` with `RESPOND_ENABLED=true`. Each override unlocks
+  exactly its own tool; neither widens into the other.
 - **Tiers** `EWS_CAPABILITY_TIER=read|draft|full` (default `draft`)
   remove above-tier tools from the registry AND refuse them at dispatch.
 - **Recipient guard** (allow/denylist globs) fires on every tool whose

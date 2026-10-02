@@ -83,6 +83,64 @@ def test_set_oof_stays_compatible_with_global_send_switch(tmp_path):
     assert result["ran"] is True
 
 
+def test_respond_switch_allows_only_respond_to_event_send_class(tmp_path):
+    ctx = _ctx(tmp_path, send_enabled=False, respond_enabled=True,
+               ews_capability_tier="full")
+    allowed = asyncio.run(dispatch(
+        ctx,
+        _spec(_ok_handler, cls="send", requires_ews=False, name="respond_to_event"),
+        {},
+    ))
+    blocked = asyncio.run(dispatch(
+        ctx, _spec(_ok_handler, cls="send", requires_ews=False, name="send_draft"), {}
+    ))
+    assert allowed["ran"] is True
+    assert blocked["ok"] is False and blocked["error"]["code"] == "kill_switch"
+
+    draft_tier = _ctx(tmp_path, send_enabled=False, respond_enabled=True,
+                      ews_capability_tier="draft")
+    tier_blocked = asyncio.run(dispatch(
+        draft_tier,
+        _spec(_ok_handler, cls="send", requires_ews=False, name="respond_to_event"),
+        {},
+    ))
+    assert tier_blocked["error"]["code"] == "tier_blocked"
+
+
+def test_respond_to_event_stays_compatible_with_global_send_switch(tmp_path):
+    ctx = _ctx(tmp_path, send_enabled=True, respond_enabled=False,
+               ews_capability_tier="full")
+    result = asyncio.run(dispatch(
+        ctx,
+        _spec(_ok_handler, cls="send", requires_ews=False, name="respond_to_event"),
+        {},
+    ))
+    assert result["ran"] is True
+
+
+def test_narrow_switches_are_independent_of_each_other(tmp_path):
+    """OOF_ENABLED must not unlock responses, and vice versa — otherwise one
+    switch would quietly widen into the other."""
+    oof_only = _ctx(tmp_path, send_enabled=False, oof_enabled=True,
+                    respond_enabled=False, ews_capability_tier="full")
+    blocked = asyncio.run(dispatch(
+        oof_only,
+        _spec(_ok_handler, cls="send", requires_ews=False, name="respond_to_event"),
+        {},
+    ))
+    assert blocked["error"]["code"] == "kill_switch"
+    assert "RESPOND_ENABLED=false" in blocked["error"]["message"]
+
+    respond_only = _ctx(tmp_path, send_enabled=False, oof_enabled=False,
+                        respond_enabled=True, ews_capability_tier="full")
+    blocked = asyncio.run(dispatch(
+        respond_only,
+        _spec(_ok_handler, cls="send", requires_ews=False, name="set_oof"), {}
+    ))
+    assert blocked["error"]["code"] == "kill_switch"
+    assert "OOF_ENABLED=false" in blocked["error"]["message"]
+
+
 def test_tier_draft_blocks_send_and_destructive(tmp_path):
     ctx = _ctx(tmp_path, send_enabled=True, ews_capability_tier="draft")
     for cls in ("send", "destructive"):

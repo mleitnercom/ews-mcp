@@ -5,6 +5,19 @@
 ### Added
 - v5 can enable two-phase-confirmed `set_oof` independently with the safe-off
   `OOF_ENABLED` switch, without enabling mail sends or meeting responses.
+- v5 can likewise enable two-phase-confirmed `respond_to_event` on its own with
+  the safe-off `RESPOND_ENABLED` switch. The response is still mailed to the
+  organizer — the switch separates that one message from general mail sending
+  rather than suppressing it.
+- v5 `delete_event` removes an own, attendee-less calendar entry by moving it
+  to Deleted Items. No message is produced, so it works with
+  `SEND_ENABLED=false`; `cancel_event` remains the meeting operation and is
+  rejected by Exchange when there is nobody to notify.
+
+### Fixed
+- v5 `create_draft(mode="reply_all")` no longer addresses the mailbox owner:
+  `create_reply_all` mirrors the original To/Cc verbatim, which put the owner
+  in their own reply.
 
 ### Changed
 - v5 `get_oof_settings` now returns up to `OOF_TEXT_MAX_CHARS` characters per

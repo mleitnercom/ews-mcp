@@ -1287,7 +1287,9 @@ TOOLS: List[ToolSpec] = [
     ToolSpec(
         name="respond_to_event",
         description=("Accept/tentative/decline a meeting — this SENDS a response "
-                     "to the organizer, so it is two-phase confirmed."),
+                     "to the organizer, so it is two-phase confirmed. Needs "
+                     "SEND_ENABLED=true, or RESPOND_ENABLED=true as the "
+                     "narrow switch for responses alone."),
         side_effect_class="send",
         input_schema=_obj({
             "event_id": _STR,
