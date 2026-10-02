@@ -221,6 +221,21 @@ def _email_list(recipients: Any) -> List[str]:
     return out
 
 
+def _own_address(account: Any) -> str:
+    return str(getattr(account, "primary_smtp_address", "") or "").lower()
+
+
+def _drop_self(recipients: Any, own: str) -> List[Any]:
+    """Recipients minus the mailbox owner, comparison case-insensitive."""
+    kept: List[Any] = []
+    for r in recipients or []:
+        addr = getattr(r, "email_address", None) or str(r)
+        if own and isinstance(addr, str) and addr.lower() == own:
+            continue
+        kept.append(r)
+    return kept
+
+
 def _prefixed(prefix: str, original_subject: Any) -> str:
     base = original_subject if isinstance(original_subject, str) else ""
     if base.lower().startswith(prefix.strip().lower()):
@@ -484,6 +499,20 @@ async def _create_draft(ctx: Context, *, body: str, mode: str = "new",
                 bcc_recipients=list(bcc) if bcc else None,
             )
             fallback = f"reconstructed_{type(original).__name__}"
+
+        if mode == "reply_all" and fallback is None:
+            # create_reply_all mirrors the original To/Cc verbatim, so the
+            # mailbox owner — who was a recipient of the original — ends up
+            # addressed in their own reply. Outlook drops the owner here; do
+            # the same. Guarded: if the owner is the ONLY party (a self-sent
+            # message), keep Exchange's recipients rather than save a draft
+            # that can reach nobody.
+            own = _own_address(account)
+            pruned_to = _drop_self(getattr(reply, "to_recipients", None), own)
+            pruned_cc = _drop_self(getattr(reply, "cc_recipients", None), own)
+            if pruned_to or pruned_cc:
+                reply.to_recipients = pruned_to or None
+                reply.cc_recipients = pruned_cc or None
 
         # Exchange quotes the original server-side, keeping threading headers.
         if fallback:
@@ -979,6 +1008,67 @@ async def _set_oof(ctx: Context, *, state: str,
 # --- DESTRUCTIVE class (tier full) -------------------------------------------
 
 
+async def _delete_event(ctx: Context, *, event_id: str) -> Dict[str, Any]:
+    """Move an own, attendee-less calendar entry to the trash.
+
+    Separate from cancel_event on purpose: cancel_event is a MEETING
+    operation that mails a cancellation to every attendee, and Exchange
+    rejects it outright when there is nobody to notify ("keine Empfänger").
+    A personal blocker has no attendees, so the only correct disposal is a
+    plain move to Deleted Items — no message leaves the mailbox, and the
+    item stays recoverable.
+    """
+    def work(account: Any) -> Dict[str, Any]:
+        item = _fetch_one(account, event_id)
+        if not isinstance(item, CalendarItem):
+            raise ToolError(
+                "validation",
+                f"{event_id} is a {type(item).__name__}, not a calendar event.",
+                hint="Use delete_messages for mail, delete_draft for drafts.",
+            )
+        attendees = [*(getattr(item, "required_attendees", None) or []),
+                     *(getattr(item, "optional_attendees", None) or []),
+                     *(getattr(item, "resources", None) or [])]
+        if attendees:
+            raise ToolError(
+                "validation",
+                f"'{getattr(item, 'subject', '') or event_id}' has "
+                f"{len(attendees)} attendee(s) — deleting it silently would "
+                "leave them with a meeting that no longer exists.",
+                hint="Use cancel_event, which notifies them (needs "
+                     "SEND_ENABLED=true).",
+            )
+        own = _own_address(account)
+        organizer = getattr(item, "organizer", None)
+        organizer_address = str(getattr(organizer, "email_address", "") or "").lower()
+        # No organizer at all = a plain appointment, which is ours by
+        # definition. A FOREIGN organizer means we only hold a copy.
+        if organizer_address and own and organizer_address != own:
+            raise ToolError(
+                "validation",
+                f"'{getattr(item, 'subject', '') or event_id}' is organized by "
+                f"{getattr(organizer, 'email_address', 'someone else')}, not by you.",
+                hint="Decline it with respond_to_event instead of deleting it.",
+            )
+        item_type = str(getattr(item, "type", "") or "")
+        if item_type == "RecurringMaster":
+            raise ToolError(
+                "validation",
+                f"'{getattr(item, 'subject', '') or event_id}' is the master of "
+                "a recurring series — deleting it would remove every occurrence.",
+                hint="Delete a single occurrence by its own id, or remove the "
+                     "series in Outlook.",
+            )
+        subject = getattr(item, "subject", "") or ""
+        start = fmt_dt(getattr(item, "start", None), ctx.settings.ews_tz)
+        item.move_to_trash()  # reversible — never HardDelete
+        return {"deleted": True, "disposition": "trash",
+                "subject": subject, "start": start,
+                "occurrence": item_type in ("Occurrence", "Exception")}
+
+    return await _gateway_write(ctx, work)
+
+
 async def _cancel_event(ctx: Context, *, event_id: str,
                         message: Optional[str] = None) -> Dict[str, Any]:
     def work(account: Any) -> Dict[str, Any]:
@@ -1208,9 +1298,26 @@ TOOLS: List[ToolSpec] = [
         confirm=True,
     ),
     ToolSpec(
+        name="delete_event",
+        description=(
+            "Move your own calendar entry to the trash WITHOUT notifying "
+            "anyone — the disposal path for personal blockers and holds. "
+            "Refuses an event that has attendees (use cancel_event), one "
+            "organized by somebody else (decline it instead), and the master "
+            "of a recurring series (delete a single occurrence by its own id). "
+            "Recoverable from Deleted Items; no message leaves the mailbox, so "
+            "it works with SEND_ENABLED=false."
+        ),
+        side_effect_class="destructive",
+        input_schema=_obj({"event_id": _STR}, required=["event_id"]),
+        handler=_delete_event,
+    ),
+    ToolSpec(
         name="cancel_event",
         description=("Cancel a meeting you organize — sends cancellations to all "
-                     "attendees (destructive, two-phase confirmed)."),
+                     "attendees (destructive, two-phase confirmed). For an "
+                     "attendee-less entry of your own use delete_event: Exchange "
+                     "rejects a cancellation that has no recipients."),
         side_effect_class="destructive",
         input_schema=_obj({"event_id": _STR, "message": _STR},
                           required=["event_id"]),

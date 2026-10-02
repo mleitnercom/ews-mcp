@@ -145,7 +145,7 @@ def make_sendable_draft():
 
 
 def test_pack_surface_classes_and_confirm_declarations():
-    assert len(writes.TOOLS) == 12
+    assert len(writes.TOOLS) == 13
     classes = {s.name: s.side_effect_class for s in writes.TOOLS}
     assert classes == {
         "create_draft": "write", "update_draft": "write", "delete_draft": "write",
@@ -153,6 +153,7 @@ def test_pack_surface_classes_and_confirm_declarations():
         "create_event": "write", "update_event": "write",
         "send_draft": "send", "respond_to_event": "send", "set_oof": "send",
         "cancel_event": "destructive", "delete_messages": "destructive",
+        "delete_event": "destructive",
     }
     for name in ("create_draft", "update_draft", "delete_draft",
                  "update_messages", "move_messages"):
@@ -168,6 +169,10 @@ def test_pack_surface_classes_and_confirm_declarations():
     assert SPEC["update_event"].confirm({"notify_attendees": True}) is True
     assert SPEC["delete_messages"].confirm({"disposition": "permanent"}) is True
     assert SPEC["delete_messages"].confirm({"disposition": "trash"}) is False
+    # delete_event lands in Deleted Items and notifies nobody, so it
+    # follows delete_messages(trash): destructive class for the tier,
+    # no confirm gate for a reversible move.
+    assert SPEC["delete_event"].confirm is False
 
 
 # --- create_draft ---------------------------------------------------------------
@@ -785,3 +790,177 @@ def test_set_oof_narrow_switch_keeps_send_disabled(tmp_path):
     p2 = call(ctx, "set_oof", {**kwargs, "confirm_token": p1["confirm_token"]})
     assert p2["ok"] is True
     assert account.oof_settings.internal_reply == "I am away"
+
+
+# --- delete_event (own, attendee-less entries) --------------------------------
+
+
+class FakeStoredEvent:
+    """A calendar item already in the mailbox. Patched over writes.CalendarItem
+    so the handler's isinstance guard sees the real production type name."""
+
+    def __init__(self, subject="Blocker", organizer="exec@corp.example",
+                 required=(), optional=(), resources=(), type_="Single"):
+        self.subject = subject
+        self.organizer = (SimpleNamespace(email_address=organizer)
+                          if organizer else None)
+        self.required_attendees = list(required)
+        self.optional_attendees = list(optional)
+        self.resources = list(resources)
+        self.type = type_
+        self.start = datetime(2026, 10, 23, 11, 0, tzinfo=RIYADH)
+        self.trashed = False
+        self.cancelled = False
+
+    def move_to_trash(self):
+        self.trashed = True
+
+    def cancel(self, **kwargs):
+        self.cancelled = True
+
+
+def _event_ctx(tmp_path, event, monkeypatch, **overrides):
+    """Tier full, sending OFF — delete_event must work in exactly that state."""
+    monkeypatch.setattr(writes, "CalendarItem", FakeStoredEvent)
+    account = make_account()
+    account.primary_smtp_address = "exec@corp.example"
+    account._by_id["RAW-EVT"] = event
+    overrides.setdefault("ews_capability_tier", "full")
+    ctx = make_ctx(tmp_path, account, **overrides)
+    return ctx, account
+
+
+def test_delete_event_trashes_own_blocker_without_sending(tmp_path, monkeypatch):
+    event = FakeStoredEvent(subject="Blocker: Open Systems 1/3")
+    ctx, _account = _event_ctx(tmp_path, event, monkeypatch)
+    assert ctx.settings.send_enabled is False  # the whole point
+
+    res = call(ctx, "delete_event", {"event_id": ctx.aliaser.alias_for("RAW-EVT", "e")})
+    assert res["ok"] is True
+    assert res["deleted"] is True and res["disposition"] == "trash"
+    assert res["subject"] == "Blocker: Open Systems 1/3"
+    assert event.trashed is True
+    assert event.cancelled is False  # no cancellation, so no mail to anyone
+
+
+def test_delete_event_refuses_event_with_attendees(tmp_path, monkeypatch):
+    event = FakeStoredEvent(
+        subject="Jour fixe",
+        required=[SimpleNamespace(email_address="peer@corp.example")])
+    ctx, _account = _event_ctx(tmp_path, event, monkeypatch)
+
+    res = call(ctx, "delete_event", {"event_id": ctx.aliaser.alias_for("RAW-EVT", "e")})
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert "attendee" in res["error"]["message"]
+    assert "cancel_event" in res["error"]["hint"]
+    assert event.trashed is False
+
+
+def test_delete_event_refuses_foreign_organizer(tmp_path, monkeypatch):
+    event = FakeStoredEvent(subject="Their meeting", organizer="boss@corp.example")
+    ctx, _account = _event_ctx(tmp_path, event, monkeypatch)
+
+    res = call(ctx, "delete_event", {"event_id": ctx.aliaser.alias_for("RAW-EVT", "e")})
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert "boss@corp.example" in res["error"]["message"]
+    assert event.trashed is False
+
+
+def test_delete_event_refuses_recurring_master(tmp_path, monkeypatch):
+    event = FakeStoredEvent(subject="Weekly", type_="RecurringMaster")
+    ctx, _account = _event_ctx(tmp_path, event, monkeypatch)
+
+    res = call(ctx, "delete_event", {"event_id": ctx.aliaser.alias_for("RAW-EVT", "e")})
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert "every occurrence" in res["error"]["message"]
+    assert event.trashed is False
+
+
+def test_delete_event_allows_single_occurrence(tmp_path, monkeypatch):
+    event = FakeStoredEvent(subject="Weekly", type_="Occurrence")
+    ctx, _account = _event_ctx(tmp_path, event, monkeypatch)
+
+    res = call(ctx, "delete_event", {"event_id": ctx.aliaser.alias_for("RAW-EVT", "e")})
+    assert res["ok"] is True and res["occurrence"] is True
+    assert event.trashed is True
+
+
+def test_delete_event_without_organizer_is_a_plain_appointment(tmp_path, monkeypatch):
+    event = FakeStoredEvent(subject="Fahrtzeit", organizer=None)
+    ctx, _account = _event_ctx(tmp_path, event, monkeypatch)
+
+    res = call(ctx, "delete_event", {"event_id": ctx.aliaser.alias_for("RAW-EVT", "e")})
+    assert res["ok"] is True and event.trashed is True
+
+
+def test_delete_event_refuses_non_calendar_item(tmp_path, monkeypatch):
+    monkeypatch.setattr(writes, "CalendarItem", FakeStoredEvent)
+    account = make_account()
+    account.primary_smtp_address = "exec@corp.example"
+    account._by_id["RAW-MAIL"] = MagicMock()  # not a FakeStoredEvent
+    ctx = make_ctx(tmp_path, account, ews_capability_tier="full")
+
+    res = call(ctx, "delete_event", {"event_id": ctx.aliaser.alias_for("RAW-MAIL", "e")})
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert "not a calendar event" in res["error"]["message"]
+
+
+def test_delete_event_needs_full_tier(tmp_path, monkeypatch):
+    event = FakeStoredEvent()
+    ctx, _account = _event_ctx(tmp_path, event, monkeypatch,
+                               ews_capability_tier="draft")
+    res = call(ctx, "delete_event", {"event_id": ctx.aliaser.alias_for("RAW-EVT", "e")})
+    assert res["ok"] is False and res["error"]["code"] == "tier_blocked"
+    assert event.trashed is False
+
+
+# --- reply_all must not address the mailbox owner ------------------------------
+
+
+def _reply_all_ctx(tmp_path, reply_to_recipients, reply_cc_recipients=None):
+    account = make_account()
+    account.primary_smtp_address = "exec@corp.example"
+    original = MagicMock()
+    original.subject = "Angebot"
+    reply_item = MagicMock()
+    reply_item.to_recipients = list(reply_to_recipients)
+    reply_item.cc_recipients = list(reply_cc_recipients or []) or None
+    reply_item.save.return_value = SimpleNamespace(id="RAW-RA", changekey="CK")
+    original.create_reply_all.return_value = reply_item
+    account._by_id["RAW-ORIG"] = original
+    return account, reply_item
+
+
+def test_reply_all_drops_the_mailbox_owner(tmp_path):
+    account, reply_item = _reply_all_ctx(
+        tmp_path,
+        [SimpleNamespace(email_address="Martz@corp.example"),
+         SimpleNamespace(email_address="EXEC@corp.example")],  # casing differs
+        [SimpleNamespace(email_address="exec@corp.example"),
+         SimpleNamespace(email_address="team@corp.example")])
+    ctx = make_ctx(tmp_path, account)
+    alias = ctx.aliaser.alias_for("RAW-ORIG", "m")
+
+    res = call(ctx, "create_draft",
+               {"mode": "reply_all", "reply_to": alias, "body": "Danke"})
+    assert res["ok"] is True
+    assert _emails(reply_item.to_recipients) == ["Martz@corp.example"]
+    assert _emails(reply_item.cc_recipients) == ["team@corp.example"]
+    assert res["preview"]["to"] == ["Martz@corp.example"]
+
+
+def test_reply_all_keeps_recipients_when_owner_is_the_only_party(tmp_path):
+    account, reply_item = _reply_all_ctx(
+        tmp_path, [SimpleNamespace(email_address="exec@corp.example")])
+    ctx = make_ctx(tmp_path, account)
+    alias = ctx.aliaser.alias_for("RAW-ORIG", "m")
+
+    res = call(ctx, "create_draft",
+               {"mode": "reply_all", "reply_to": alias, "body": "Notiz"})
+    assert res["ok"] is True
+    # Stripping would leave a draft nobody can receive — keep what Exchange built.
+    assert _emails(reply_item.to_recipients) == ["exec@corp.example"]
+
+
+def _emails(recipients):
+    return [getattr(r, "email_address", str(r)) for r in (recipients or [])]
