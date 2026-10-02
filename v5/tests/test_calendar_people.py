@@ -392,7 +392,7 @@ def test_find_people_source_contacts_never_hits_gal(tmp_path):
 # --- get_oof_settings ----------------------------------------------------------
 
 
-def test_get_oof_settings_html_stripped_and_capped(tmp_path):
+def test_get_oof_settings_html_stripped_and_uses_configured_cap(tmp_path):
     account = MagicMock()
     account.oof_settings = SimpleNamespace(
         state="Scheduled",
@@ -407,9 +407,20 @@ def test_get_oof_settings_html_stripped_and_capped(tmp_path):
     assert res["state"] == "scheduled"
     assert res["internal_reply_text"] == "سأكون خارج المكتب حتى الخميس"
     assert "<" not in res["external_reply_text"]
-    assert len(res["external_reply_text"]) <= 500
+    assert 500 < len(res["external_reply_text"]) <= 4000
     assert res["start"] == "2026-06-20T08:00+03:00"
     assert res["end"] == "2026-06-25T17:00+03:00"
+
+
+def test_get_oof_settings_honours_smaller_configured_cap(tmp_path):
+    account = MagicMock()
+    account.oof_settings = SimpleNamespace(
+        state="Enabled", internal_reply="x" * 100, external_reply="y" * 100,
+    )
+    ctx = _ctx(tmp_path, account, oof_text_max_chars=42)
+    res = _run(ctx, "get_oof_settings", {})
+    assert res["internal_reply_text"] == "x" * 42
+    assert res["external_reply_text"] == "y" * 42
 
 
 # --- get_server_status -----------------------------------------------------------
@@ -428,6 +439,7 @@ def test_get_server_status_with_manager_none(tmp_path):
     assert res["connection"] == {"state": "unmanaged"}
     assert res["tier"] == "draft"
     assert res["send_kill_switch"] is True  # send_enabled defaults False
+    assert res["oof_kill_switch"] is True  # both send/oof switches default False
     assert res["tools"] == 8
     assert res["counters"]["tool.list_events"] == 3
     assert res["alias_stats"] == {"m": 1}

@@ -771,3 +771,17 @@ def test_set_oof_phase_one_preview_then_plain_string_replies(tmp_path):
     assert oof.state == OofSettings.ENABLED
     assert oof.internal_reply == "I am away"  # plain str — no OofReply wrapper
     assert oof.external_reply == "I am away"  # defaulted; clean() needs both
+
+
+def test_set_oof_narrow_switch_keeps_send_disabled(tmp_path):
+    account = make_account()
+    ctx = make_ctx(
+        tmp_path, account, send_enabled=False, oof_enabled=True,
+        ews_capability_tier="full",
+    )
+    kwargs = {"state": "enabled", "internal_reply": "I am away"}
+    p1 = call(ctx, "set_oof", kwargs)
+    assert p1["requires_confirmation"] is True
+    p2 = call(ctx, "set_oof", {**kwargs, "confirm_token": p1["confirm_token"]})
+    assert p2["ok"] is True
+    assert account.oof_settings.internal_reply == "I am away"

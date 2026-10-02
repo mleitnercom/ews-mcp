@@ -299,12 +299,29 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
     confirm_token = kwargs.pop("confirm_token", None)
     try:
         # Kill-switch (policy precedes connectivity)
-        if spec.side_effect_class == "send" and not ctx.settings.send_enabled:
+        oof_override = spec.name == "set_oof" and ctx.settings.oof_enabled
+        if (spec.side_effect_class == "send"
+                and not ctx.settings.send_enabled
+                and not oof_override):
+            if spec.name == "set_oof":
+                message = (
+                    "set_oof is blocked: SEND_ENABLED=false and "
+                    "OOF_ENABLED=false on this server."
+                )
+                hint = (
+                    "Have the operator flip OOF_ENABLED (narrow) or "
+                    "SEND_ENABLED (global)."
+                )
+            else:
+                message = f"{spec.name} is blocked: SEND_ENABLED=false on this server."
+                hint = (
+                    "Create a draft instead; sending requires the operator "
+                    "to flip SEND_ENABLED."
+                )
             raise ToolError(
                 "kill_switch",
-                f"{spec.name} is blocked: SEND_ENABLED=false on this server.",
-                hint="Create a draft instead; sending requires the operator "
-                     "to flip SEND_ENABLED.",
+                message,
+                hint=hint,
             )
         # Tier
         tier = ctx.settings.ews_capability_tier

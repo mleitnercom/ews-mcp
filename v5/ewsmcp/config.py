@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # --- Safety -------------------------------------------------------------
     ews_capability_tier: Literal["read", "draft", "full"] = "draft"
     send_enabled: bool = False  # kill-switch: v5 defaults SAFE (off)
+    # Narrow escape hatch for OOF updates.  This lets an operator enable
+    # set_oof without enabling mail sends or meeting responses globally.
+    # SEND_ENABLED=true remains sufficient for backwards compatibility.
+    oof_enabled: bool = False
     send_confirm_secret: Optional[str] = None
     confirm_ttl_seconds: int = 600  # ONE default everywhere (== confirm.DEFAULT_TTL_SECONDS)
     ews_recipient_allowlist: str = ""
@@ -87,6 +91,7 @@ class Settings(BaseSettings):
     # --- Response economy ----------------------------------------------------
     default_page_size: int = Field(default=20, le=50)
     body_max_chars: int = 4000
+    oof_text_max_chars: int = Field(default=4000, ge=1)
 
     @model_validator(mode="after")
     def _resolve_data_dir(self) -> "Settings":

@@ -27,6 +27,8 @@ services:
       MCP_API_KEY: ${MCP_API_KEY:?fresh canary key — never reuse prod's}
       EWS_CAPABILITY_TIER: ${EWS_CAPABILITY_TIER:-read}
       SEND_ENABLED: ${SEND_ENABLED:-false}
+      OOF_ENABLED: ${OOF_ENABLED:-false}
+      OOF_TEXT_MAX_CHARS: ${OOF_TEXT_MAX_CHARS:-4000}
       DATA_DIR: /data
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:

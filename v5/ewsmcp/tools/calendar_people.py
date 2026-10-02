@@ -506,7 +506,8 @@ async def _get_oof_settings(ctx: Context) -> Dict[str, Any]:
     oof = await ctx.gateway.call(lambda account: account.oof_settings)
 
     def reply_text(value: Any) -> str:
-        return html_to_text(str(value))[:500] if value else ""
+        limit = ctx.settings.oof_text_max_chars
+        return html_to_text(str(value))[:limit] if value else ""
 
     out: Dict[str, Any] = {
         "ok": True,
@@ -541,6 +542,9 @@ async def _get_server_status(ctx: Context) -> Dict[str, Any]:
         "connection": ctx.manager.status() if ctx.manager else {"state": "unmanaged"},
         "tier": ctx.settings.ews_capability_tier,
         "send_kill_switch": not ctx.settings.send_enabled,
+        "oof_kill_switch": not (
+            ctx.settings.oof_enabled or ctx.settings.send_enabled
+        ),
         "tools": len(ctx.registry),
         "counters": dict(ctx.counters),
         "alias_stats": ctx.aliaser.stats(),
@@ -721,7 +725,7 @@ TOOLS: List[ToolSpec] = [
             "Read the mailbox out-of-office (automatic reply) settings: "
             "state (disabled/enabled/scheduled), the scheduled window when "
             "applicable, and the internal/external reply texts (HTML "
-            "stripped, capped at 500 chars)."
+            "stripped, capped by OOF_TEXT_MAX_CHARS; default 4000)."
         ),
         side_effect_class="read",
         input_schema={
@@ -736,8 +740,8 @@ TOOLS: List[ToolSpec] = [
         name="get_server_status",
         description=(
             "This server's own status: version, uptime, Exchange connection "
-            "state, capability tier, send kill-switch, tool count, per-tool "
-            "call counters and alias statistics. Never touches Exchange — "
+            "state, capability tier, send/OOF kill-switches, tool count, "
+            "per-tool call counters and alias statistics. Never touches Exchange — "
             "it answers even while the connection is still warming up, so "
             "use it to explain connectivity problems."
         ),

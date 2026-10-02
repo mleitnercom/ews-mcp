@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+- v5 can enable two-phase-confirmed `set_oof` independently with the safe-off
+  `OOF_ENABLED` switch, without enabling mail sends or meeting responses.
+
+### Changed
+- v5 `get_oof_settings` now returns up to `OOF_TEXT_MAX_CHARS` characters per
+  reply (default 4000) instead of truncating every reply at 500 characters.
+
 ### Documentation
 - Repository-wide revamp: the root README is now a single front door
   (version guide, stdio-first quick start); `docs/README.md` maps all

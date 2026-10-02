@@ -22,8 +22,8 @@ the registry is the single source of truth for what exists.
 | `check_availability` | read | read | Check free/busy for one or more attendees and propose meeting slots. |
 | `find_people` | read | read | Find people by name or email fragment in the GAL (global address list) and/or the personal contacts folder. |
 | `get_contact` | read | read | Fetch one person in full by id — a p-alias from find_people, a raw contact id, or a plain email address. |
-| `get_oof_settings` | read | read | Read the mailbox out-of-office (automatic reply) settings: state (disabled/enabled/scheduled), the scheduled window when applicable, and the |
-| `get_server_status` | read | read | This server's own status: version, uptime, Exchange connection state, capability tier, send kill-switch, tool count, per-tool call counters and alias statistics. |
+| `get_oof_settings` | read | read | Read the mailbox out-of-office (automatic reply) settings: state (disabled/enabled/scheduled), the scheduled window when applicable, and the internal/external reply texts (HTML stripped, capped by OOF_TEXT_MAX_CHARS; |
+| `get_server_status` | read | read | This server's own status: version, uptime, Exchange connection state, capability tier, send/OOF kill-switches, tool count, per-tool call counters and alias statistics. |
 | `get_operation_status` | read | read | Read one durable create-operation journal entry by operation_id. |
 | `list_tasks` | read | read | List Exchange tasks (to-dos), incomplete ones by default. |
 | `update_task` | write | draft | Update ONE task: mark it complete and/or set its due date ('today', '+Nd', YYYY-MM-DD). |
@@ -186,13 +186,13 @@ Fetch one person in full by id — a p-alias from find_people, a raw contact id,
 
 #### `get_oof_settings` — read (min tier: read)
 
-Read the mailbox out-of-office (automatic reply) settings: state (disabled/enabled/scheduled), the scheduled window when applicable, and the internal/external reply texts (HTML stripped, capped at 500 chars).
+Read the mailbox out-of-office (automatic reply) settings: state (disabled/enabled/scheduled), the scheduled window when applicable, and the internal/external reply texts (HTML stripped, capped by OOF_TEXT_MAX_CHARS; default 4000).
 
 _No parameters._
 
 #### `get_server_status` — read (min tier: read)
 
-This server's own status: version, uptime, Exchange connection state, capability tier, send kill-switch, tool count, per-tool call counters and alias statistics. Never touches Exchange — it answers even while the connection is still warming up, so use it to explain connectivity problems.
+This server's own status: version, uptime, Exchange connection state, capability tier, send/OOF kill-switches, tool count, per-tool call counters and alias statistics. Never touches Exchange — it answers even while the connection is still warming up, so use it to explain connectivity problems.
 
 _No parameters._
 
@@ -534,7 +534,7 @@ ids change when items move; re-run the search for fresh ones.
 | `validation` | 400 | bad arguments (schema-checked on the REST shim) |
 | `auth_failed` | 401 | bad/missing API key, or Exchange rejected credentials |
 | `tier_blocked` | 403 | tool needs a higher `EWS_CAPABILITY_TIER` |
-| `kill_switch` | 403 | send-class call while `SEND_ENABLED=false` |
+| `kill_switch` | 403 | send-class call while `SEND_ENABLED=false` (`set_oof` may use the narrower `OOF_ENABLED=true` override) |
 | `recipient_blocked` | 403 | recipient failed the allow/denylist |
 | `protected_folder` | 403 | attempted mutation of a system/root folder |
 | `protected_contact` | 403 | attempted mutation of a read-only GAL/directory entry |
