@@ -146,6 +146,13 @@ class ProcessCoordinator:
                 (self.instance_id, self.pid, self.mailbox, now, now),
             )
             conn.execute("DELETE FROM instances WHERE heartbeat < ?", (now - 3600,))
+            # Every start used to leave a waiters:<id> row behind forever;
+            # 160+ of them had accumulated. Drop the ones whose instance is
+            # gone — the state table is a live view, not a journal.
+            conn.execute(
+                "DELETE FROM state WHERE key LIKE 'waiters:%' AND "
+                "substr(key, 9) NOT IN (SELECT instance_id FROM instances)"
+            )
 
     def heartbeat(self) -> None:
         with self._connect() as conn:

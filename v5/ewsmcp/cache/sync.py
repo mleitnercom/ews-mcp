@@ -40,6 +40,8 @@ ITEM_FIELDS = [
 ]
 TASK_FIELDS = ["id", "changekey", "subject", "due_date", "is_complete", "status"]
 BODY_CLEAN_MAX = 20_000
+# Superseded by EWS_CALENDAR_WINDOW_DAYS / _MAX_ITEMS; kept so an
+# out-of-tree importer does not break.
 CALENDAR_WINDOW_DAYS = 14
 CALENDAR_MAX_ITEMS = 200
 
@@ -178,6 +180,12 @@ class SyncEngine:
     async def _loop(self) -> None:
         while not self._stopped:
             try:
+                if self.coordinator is not None:
+                    # EVERY instance ticks here, leader or not. Without this
+                    # the heartbeat was only written when someone happened to
+                    # call get_server_status, so instance counts were noise:
+                    # 11 stale rows one day, 0 live ones the next.
+                    self.coordinator.heartbeat()
                 if self.coordinator is None or self.coordinator.try_become_sync_leader():
                     await self._cycle()
                 self.last_error = None
@@ -272,24 +280,32 @@ class SyncEngine:
         except Exception as exc:
             logger.debug("folder tree sync failed: %s", exc)
 
-        # Expanded calendar occurrences for the overview window.
+        # Expanded calendar occurrences for the overview window. The window
+        # reaches BACKWARDS as well: a briefing that includes yesterday, or a
+        # weekly review, would otherwise miss the mirror by definition and
+        # fall through to a live CalendarView.
         try:
             now = datetime.now(ZoneInfo(tz))
             day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            window_start = day_start - timedelta(
+                days=int(self.settings.ews_calendar_backfill_days))
+            window_end = day_start + timedelta(
+                days=int(self.settings.ews_calendar_window_days))
             events = list(account.calendar.view(
-                start=day_start,
-                end=day_start + timedelta(days=CALENDAR_WINDOW_DAYS),
-                max_items=CALENDAR_MAX_ITEMS,
+                start=window_start,
+                end=window_end,
+                max_items=int(self.settings.ews_calendar_max_items),
             ))
             self.store.replace_events(
                 [row_from_event(ev, tz) for ev in events
                  if getattr(ev, "id", None)])
             self.store.set_sync_state("events", None, time.time())
-            self.store.set_sync_state("events:start", str(int(day_start.timestamp())),
+            self.store.set_sync_state("events:start",
+                                      str(int(window_start.timestamp())),
                                       time.time())
-            self.store.set_sync_state(
-                "events:end", str(int((day_start + timedelta(
-                    days=CALENDAR_WINDOW_DAYS)).timestamp())), time.time())
+            self.store.set_sync_state("events:end",
+                                      str(int(window_end.timestamp())),
+                                      time.time())
         except Exception as exc:
             logger.debug("calendar window sync failed: %s", exc)
 

@@ -6,7 +6,7 @@ import asyncio
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -15,6 +15,7 @@ from conftest import make_settings
 
 from ewsmcp.audit import AuditLog
 from ewsmcp.cache.store import CacheStore
+from ewsmcp.cache.sync import SyncEngine
 from ewsmcp.coordination import ProcessCoordinator
 from ewsmcp.dates import parse_when
 from ewsmcp.errors import ToolError
@@ -251,3 +252,105 @@ def test_background_sync_is_not_clipped_by_single_request_timeout():
             multi_request_sync, lane="sync", timeout_s=0)
 
     assert asyncio.run(scenario()) == "synced"
+
+def test_heartbeat_keeps_instances_countable(tmp_path):
+    """status() used to be the ONLY caller of heartbeat(), so an instance
+    nobody asked about aged out of the 120 s window and the count read 0
+    while servers were running."""
+    data_dir = str(tmp_path / "hb")
+    one = ProcessCoordinator(data_dir, "exec@corp.example")
+    two = ProcessCoordinator(data_dir, "exec@corp.example")
+    try:
+        with sqlite3.connect(f"{data_dir}/coordination/control.db") as conn:
+            stale = time.time() - 600
+            conn.execute("UPDATE instances SET heartbeat=?", (stale,))
+        assert one.status()["active_instances"] == 1  # only the one that asked
+
+        two.heartbeat()  # what the sync loop now does every cycle
+        assert one.status()["active_instances"] == 2
+    finally:
+        one.close()
+        two.close()
+
+
+def test_registering_prunes_waiters_of_dead_instances(tmp_path):
+    data_dir = str(tmp_path / "waiters")
+    first = ProcessCoordinator(data_dir, "exec@corp.example")
+    first_id = first.instance_id
+    first.close()
+
+    # A waiters row is written on the first live call, not at registration —
+    # reproduce the state an exited instance leaves behind.
+    db = f"{data_dir}/coordination/control.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO state (key, value, updated) VALUES (?, ?, ?)",
+            (f"waiters:{first_id}", "0", time.time()),
+        )
+        conn.execute("DELETE FROM instances WHERE instance_id=?", (first_id,))
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM state WHERE key=?", (f"waiters:{first_id}",)
+        ).fetchone()[0]
+    assert rows == 1, "the orphaned waiters row is the thing under test"
+
+    second = ProcessCoordinator(data_dir, "exec@corp.example")
+    third = None
+    try:
+        with sqlite3.connect(db) as conn:
+            orphan = conn.execute(
+                "SELECT COUNT(*) FROM state WHERE key=?", (f"waiters:{first_id}",)
+            ).fetchone()[0]
+        assert orphan == 0, "dead instance's waiters row must be gone"
+
+        # A row belonging to a REGISTERED instance must survive the next
+        # registration — pruning may not take live instances with it.
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO state (key, value, updated) VALUES (?, ?, ?)",
+                (f"waiters:{second.instance_id}", "0", time.time()),
+            )
+        third = ProcessCoordinator(data_dir, "exec@corp.example")
+        with sqlite3.connect(db) as conn:
+            alive = conn.execute(
+                "SELECT COUNT(*) FROM state WHERE key=?",
+                (f"waiters:{second.instance_id}",),
+            ).fetchone()[0]
+        assert alive == 1, "a live instance keeps its waiters row"
+    finally:
+        if third is not None:
+            third.close()
+        second.close()
+
+
+def test_calendar_mirror_window_reaches_backwards(tmp_path):
+    """A briefing that includes yesterday must not be forced live: the
+    mirrored window starts BEFORE today, by ews_calendar_backfill_days."""
+    settings = make_settings(ews_tz="Europe/Vienna",
+                             ews_calendar_backfill_days=7,
+                             ews_calendar_window_days=14)
+    now = datetime.now(VIENNA)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    expected_start = day_start - timedelta(days=7)
+    expected_end = day_start + timedelta(days=14)
+
+    captured = {}
+
+    class FakeCalendar:
+        def view(self, start, end, max_items):
+            captured["start"] = start
+            captured["end"] = end
+            captured["max_items"] = max_items
+            return []
+
+    account = SimpleNamespace(calendar=FakeCalendar(),
+                              msg_folder_root=SimpleNamespace(walk=lambda: []))
+    store = CacheStore(str(tmp_path / "mirror.db"))
+    engine = SyncEngine(settings, gateway=None, store=store)
+    try:
+        engine._sync_slow_lane(account)
+    except Exception:
+        pass  # folders/tasks need more of the account; the calendar ran first
+    assert captured, "calendar view was never called"
+    assert abs((captured["start"] - expected_start).total_seconds()) < 2
+    assert abs((captured["end"] - expected_end).total_seconds()) < 2
+    assert captured["max_items"] == settings.ews_calendar_max_items

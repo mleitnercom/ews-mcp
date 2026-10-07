@@ -83,6 +83,18 @@ class Settings(BaseSettings):
     ews_cache_enabled: bool = True
     ews_cache_folders: str = "inbox,sent"
     ews_cache_sync_seconds: int = 45
+    # Mirrored CalendarView window. It used to start at today's midnight,
+    # which meant ANY query reaching even one day back missed the mirror and
+    # fell through to a live CalendarView — the slowest call in the surface.
+    # Backfilling a week makes yesterday-inclusive briefings and weekly
+    # reviews cache-served.
+    ews_calendar_window_days: int = Field(default=14, ge=1, le=120)
+    ews_calendar_backfill_days: int = Field(default=7, ge=0, le=120)
+    ews_calendar_max_items: int = Field(default=200, ge=1, le=1000)
+    # A live CalendarView is far slower than any other read: observed 10-28 s
+    # against a 30 s request_timeout, so near-misses failed outright. The
+    # calendar lane gets its own, more generous deadline.
+    ews_calendar_timeout_seconds: int = Field(default=90, ge=5, le=600)
     ews_cache_hierarchy_seconds: int = 600
     ews_cache_window_days: int = 365
     ews_cache_purge_on_boot: bool = False  # admin path: wipe + resync from scratch

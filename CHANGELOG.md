@@ -15,6 +15,21 @@
   rejected by Exchange when there is nobody to notify.
 
 ### Fixed
+- v5 mirrors a calendar window that reaches BACKWARDS
+  (`EWS_CALENDAR_BACKFILL_DAYS`, default 7). It previously started at today's
+  midnight, so any query including yesterday missed the mirror by definition
+  and fell through to a live CalendarView — the slowest call in the surface,
+  which then failed outright against the shared 30 s request timeout.
+- v5 gives the calendar lane its own deadline
+  (`EWS_CALENDAR_TIMEOUT_SECONDS`, default 90). Live CalendarView reads of
+  10-28 s were observed against a 30 s limit, so near-misses errored instead
+  of returning. A live failure with no mirror coverage now names the mirrored
+  window instead of reporting a bare timeout.
+- v5 writes the coordination heartbeat from the sync loop in every instance.
+  It was only written when `get_server_status` happened to be called, so
+  `active_instances` reported stale rows or none at all.
+- v5 prunes `waiters:<instance>` rows of instances that are gone; they
+  accumulated indefinitely (160+ observed in a long-running deployment).
 - v5 `create_draft(mode="reply_all")` no longer addresses the mailbox owner:
   `create_reply_all` mirrors the original To/Cc verbatim, which put the owner
   in their own reply.

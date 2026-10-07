@@ -24,6 +24,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from itertools import islice
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 from exchangelib import EWSTimeZone
@@ -173,6 +174,35 @@ def _cached_events(ctx: Context, start_dt: datetime, end_dt: datetime,
     return result
 
 
+def _no_coverage_error(ctx: Context, exc: Exception, start_dt: datetime,
+                       end_dt: datetime) -> ToolError:
+    """Turn a bare live failure into a message that names the mirrored window.
+
+    A live CalendarView only runs when the request falls outside the mirror,
+    so the useful answer is almost always "ask inside the mirrored range" —
+    which the caller cannot know unless we state it.
+    """
+    span = ""
+    try:
+        if ctx.cache is not None:
+            lo = ctx.cache.get_sync_state("events:start")
+            hi = ctx.cache.get_sync_state("events:end")
+            if lo and hi:
+                tz = ZoneInfo(ctx.settings.ews_tz)
+                span = (f" The mirror covers "
+                        f"{datetime.fromtimestamp(int(lo), tz):%Y-%m-%d} to "
+                        f"{datetime.fromtimestamp(int(hi), tz):%Y-%m-%d}; "
+                        f"you asked for {start_dt:%Y-%m-%d} to {end_dt:%Y-%m-%d}.")
+    except Exception:  # noqa: BLE001 — diagnostics must never mask the cause
+        span = ""
+    return ToolError(
+        "upstream_timeout",
+        f"Live calendar read failed ({type(exc).__name__}).{span}",
+        hint="Narrow the window, or widen the mirror with "
+             "EWS_CALENDAR_BACKFILL_DAYS / EWS_CALENDAR_WINDOW_DAYS.",
+    )
+
+
 async def _list_events(ctx: Context, start: str = "today", end: str = "+7d",
                        offset: int = 0, limit: int = 25,
                        fresh: bool = False) -> Dict[str, Any]:
@@ -207,14 +237,17 @@ async def _list_events(ctx: Context, start: str = "today", end: str = "+7d",
     try:
         items = await _gateway_call(
             ctx, work, lane="calendar",
-            timeout_s=float(ctx.settings.request_timeout),
+            timeout_s=float(ctx.settings.ews_calendar_timeout_seconds),
         )
     except Exception as exc:
         if cached is not None:
             cached["fallback"] = "live_failed"
             cached["warning"] = f"{type(exc).__name__}: {exc}"[:500]
             return cached
-        raise
+        # No mirror coverage to fall back on. Say so with the actual window
+        # instead of a bare timeout: "narrow the range" is actionable, the
+        # timeout alone is not.
+        raise _no_coverage_error(ctx, exc, start_dt, end_dt) from exc
     truncated = len(items) >= cap
     total = None if truncated else len(items)
     page = items[offset:offset + limit]
