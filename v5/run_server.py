@@ -66,6 +66,12 @@ def _setup_logging() -> None:
     stream.setFormatter(fmt)
     root.addHandler(stream)
 
+    # exchangelib logs one INFO line PER FIELD for naive datetimes and
+    # unknown timezone ids. On a normal mailbox that is thousands of lines
+    # an hour and it buried the useful entries on 2026-10-09. Warnings from
+    # the same logger still come through.
+    logging.getLogger("exchangelib.fields").setLevel(logging.WARNING)
+
     data_dir = (os.environ.get("DATA_DIR") or _env_from_dotenv("DATA_DIR")
                 or os.path.join(HERE, "data"))
     try:

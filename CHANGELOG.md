@@ -15,6 +15,16 @@
   rejected by Exchange when there is nobody to notify.
 
 ### Fixed
+- v5 drops exchangelib's session pool whenever a heartbeat probe fails,
+  before reconnecting. The recovery ladder only reset every third FAILED
+  attempt, so a reconnect that succeeded on the first attempt kept sockets
+  that had died with the connection (sleep, VPN drop, Exchange restart).
+  exchangelib then handed a dead session to the next caller, which blocked
+  until the OS timed out the TCP connection — minutes, while the server
+  looked warm.
+- v5 logs every dispatch as a ">> tool args" / "<< tool outcome ms" pair.
+  A call that never finishes leaves a ">>" with no "<<"; the audit chain
+  records completions only, so a hang previously left no trace at all.
 - v5 mirrors a calendar window that reaches BACKWARDS
   (`EWS_CALENDAR_BACKFILL_DAYS`, default 7). It previously started at today's
   midnight, so any query including yesterday missed the mirror by definition

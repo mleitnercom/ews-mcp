@@ -111,3 +111,55 @@ def test_local_folder_mutation_publishes_revision_without_clearing_root():
     assert gw._folder_revision_seen == 1
     assert gw._folder_cache == {}
     account.msg_folder_root.clear_cache.assert_not_called()
+
+# --- recovery after a degraded probe -----------------------------------------
+
+
+def test_degraded_recovery_drops_the_session_pool_before_reconnecting():
+    """A probe failure means the cached Protocol's session pool may hold
+    sockets that died with the connection. Reconnecting does not discard
+    them, so the next caller draws a dead session and blocks until the OS
+    times out the TCP connection — minutes, not seconds.
+
+    The old ladder only reset every third FAILED attempt, so a recovery that
+    succeeded on the first attempt kept the poisoned pool. Observed live on
+    2026-10-09: probe failed 07:49:31, reconnect succeeded 07:49:31, and
+    calls hung for ~2 minutes each for hours afterwards.
+    """
+    import asyncio
+
+    from ewsmcp.gateway.connection import ConnectionManager
+
+    order = []
+    client = MagicMock(name="client")
+    client.reset.side_effect = lambda: order.append("reset")
+    client.test_connection.side_effect = lambda: (order.append("connect"), True)[1]
+
+    manager = ConnectionManager(client, heartbeat_seconds=3600)
+    try:
+        asyncio.run(manager._warmup_loop(reset_first=True))
+    finally:
+        manager._stopped = True
+
+    assert order[:2] == ["reset", "connect"], (
+        f"pool must be dropped BEFORE the reconnect attempt, got {order}")
+    assert manager.state == "warm"
+
+
+def test_plain_warmup_does_not_reset_on_the_first_attempt():
+    """Boot is not a recovery: a cold start has no stale pool to discard,
+    and resetting there would throw away the negotiation it just did."""
+    import asyncio
+
+    from ewsmcp.gateway.connection import ConnectionManager
+
+    client = MagicMock(name="client")
+    client.test_connection.return_value = True
+    manager = ConnectionManager(client, heartbeat_seconds=3600)
+    try:
+        asyncio.run(manager._warmup_loop())
+    finally:
+        manager._stopped = True
+
+    client.reset.assert_not_called()
+

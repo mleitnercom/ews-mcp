@@ -115,8 +115,24 @@ class ConnectionManager:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-    async def _warmup_loop(self) -> None:
+    async def _warmup_loop(self, reset_first: bool = False) -> None:
         backoff = self._initial_backoff
+        if reset_first:
+            # A probe that just failed means the cached Protocol's session
+            # pool may hold sockets that died with the connection (sleep,
+            # VPN drop, Exchange restart). Reconnecting does NOT discard
+            # them: exchangelib hands a dead session to the next caller,
+            # which then blocks until the OS gives up on the TCP connection
+            # — minutes, not the seconds a reconnect suggests. The old
+            # ladder only reset every Nth FAILED attempt, so a recovery that
+            # succeeded on attempt 1 kept the poisoned pool.
+            try:
+                await asyncio.to_thread(self._client.reset)
+                self.logger.info(
+                    "warmup: dropped the EWS session pool before reconnecting"
+                )
+            except Exception as exc:
+                self.logger.debug("warmup: pre-reconnect reset failed: %s", exc)
         while not self._stopped:
             ok = await asyncio.to_thread(self._try_connect)
             if ok:
@@ -183,7 +199,7 @@ class ConnectionManager:
                 # Re-enter the warmup loop (which restarts the heartbeat on
                 # success). Exit this heartbeat; warmup owns recovery now.
                 self._task = asyncio.create_task(
-                    self._warmup_loop(), name="ews-warmup"
+                    self._warmup_loop(reset_first=True), name="ews-warmup"
                 )
                 return
 

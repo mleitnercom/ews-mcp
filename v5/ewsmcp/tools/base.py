@@ -10,6 +10,7 @@ handler (on the EWS pool) → audit.
 
 import asyncio
 import fnmatch
+import logging
 import threading
 import time
 from collections import deque
@@ -18,6 +19,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from ..confirm import consume_token, content_hash, make_token, verify_token
 from ..errors import ToolError, map_exception
+
+logger = logging.getLogger(__name__)
 
 TIER_RANK = {"read": 0, "draft": 1, "full": 2}
 CLASS_TIER = {"read": "read", "write": "draft", "send": "full", "destructive": "full"}
@@ -296,10 +299,38 @@ def _resolve_ids(ctx: Context, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _arg_digest(kwargs: Dict[str, Any]) -> str:
+    """Argument summary for the log: shapes and scalars, never content.
+
+    Bodies, subjects and recipients stay out — the log sits next to the
+    mailbox mirror but is read by people debugging timeouts, not by people
+    entitled to the mail itself.
+    """
+    parts = []
+    for key in ("folder", "to_folder", "parent", "id", "ids", "event_id",
+                "draft_id", "start", "end", "limit", "offset", "fresh",
+                "mode", "disposition", "depth", "query", "subject"):
+        if key not in kwargs or kwargs[key] is None:
+            continue
+        value = kwargs[key]
+        if key in ("query", "subject"):
+            parts.append(f"{key}=<{len(str(value))} chars>")
+        elif isinstance(value, (list, tuple)):
+            parts.append(f"{key}=[{len(value)}]")
+        else:
+            parts.append(f"{key}={value}")
+    return " ".join(parts) or "-"
+
+
 async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
                    transport: str = "-") -> Dict[str, Any]:
     start = time.time()
     outcome = "ok"
+    # One line in, one line out. A call that hangs leaves a ">>" with no
+    # matching "<<", which is the only way to see from the log that the
+    # server never finished — the audit chain records completions only.
+    logger.info(">> %s lane=%s args=%s", spec.name, spec.side_effect_class,
+                _arg_digest(kwargs))
     # confirm_token is dispatcher vocabulary, never a handler argument —
     # strip it unconditionally so non-confirm handlers can't receive it
     # (a leak here used to surface as TypeError → misleading 502).
@@ -414,9 +445,12 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
                       if kwargs.get(k) is not None}
         # Audit writes (file append + chain hash) run off the event loop —
         # one slow disk must not stall every concurrent request.
+        elapsed_ms = int((time.time() - start) * 1000)
+        log = logger.warning if elapsed_ms >= 5000 or outcome != "ok" else logger.info
+        log("<< %s %s %dms", spec.name, outcome, elapsed_ms)
         await asyncio.to_thread(
             ctx.audit.record,
             tool=spec.name, side_effect_class=spec.side_effect_class,
-            outcome=outcome, latency_ms=int((time.time() - start) * 1000),
+            outcome=outcome, latency_ms=elapsed_ms,
             transport=transport, detail=detail,
         )
