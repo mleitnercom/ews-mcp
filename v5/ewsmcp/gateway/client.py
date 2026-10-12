@@ -157,13 +157,26 @@ class EWSGateway:
         no_outer_deadline = timeout_s is not None and timeout <= 0
         pool = self._lane_pools.get(lane, self._pool)
 
+        queued_at = time.time()
+
         def invoke() -> Any:
+            # Three phases, timed separately: how long the job sat in this
+            # process's lane pool, how long it waited for the SHARED lane
+            # lock, and how long Exchange actually took. A slow call looks
+            # identical from outside no matter which of the three it was,
+            # which is exactly what made 2026-10-09/12 hard to pin down.
+            pool_wait = time.time() - queued_at
+            lock_wait = 0.0
+            started = time.time()
             try:
                 if self.coordinator is None:
                     return fn(self.account)
                 lock_timeout = (float(self.settings.request_timeout)
                                 if no_outer_deadline else timeout)
+                before_lock = time.time()
                 with self.coordinator.live_call(lane, lock_timeout):
+                    lock_wait = time.time() - before_lock
+                    started = time.time()
                     return fn(self.account)
             except Exception as exc:
                 if self.coordinator is not None:
@@ -172,6 +185,14 @@ class EWSGateway:
                         self.coordinator.set_cooldown(
                             backoff, f"{type(exc).__name__}: {exc}")
                 raise
+            finally:
+                total = time.time() - queued_at
+                if total >= 2.0:
+                    logger.warning(
+                        "slow %s lane call: %.1fs total "
+                        "(pool wait %.1fs, lock wait %.1fs, exchange %.1fs)",
+                        lane, total, pool_wait, lock_wait,
+                        max(0.0, time.time() - started))
 
         future = loop.run_in_executor(pool, invoke)
         if no_outer_deadline:
