@@ -15,6 +15,16 @@
   rejected by Exchange when there is nobody to notify.
 
 ### Fixed
+- v5 refreshes the mirrored calendar on its own, much slower clock
+  (`EWS_CALENDAR_SYNC_SECONDS`, default 30 min) and skips a refresh while
+  user calls are waiting on Exchange. Measured on Exchange 2016: the
+  CalendarView costs 45 s of server time versus 4 s for the folder tree and
+  0 s for tasks. Separate lanes do not protect user reads from it — both
+  draw on the same mailbox throttling budget, so a read issued inside a
+  sync window took 23 s at Exchange with 0.1 s of local lock wait.
+- v5 defaults `EWS_CALENDAR_BACKFILL_DAYS` to 2 rather than 7. Every
+  backfilled day is paid on every refresh; two days still cover the
+  yesterday-inclusive briefing the backfill was added for.
 - v5 drops exchangelib's session pool whenever a heartbeat probe fails,
   before reconnecting. The recovery ladder only reset every third FAILED
   attempt, so a reconnect that succeeded on the first attempt kept sockets

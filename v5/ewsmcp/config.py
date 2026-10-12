@@ -89,12 +89,23 @@ class Settings(BaseSettings):
     # Backfilling a week makes yesterday-inclusive briefings and weekly
     # reviews cache-served.
     ews_calendar_window_days: int = Field(default=14, ge=1, le=120)
-    ews_calendar_backfill_days: int = Field(default=7, ge=0, le=120)
+    # Measured 2026-10-12 against Exchange 2016: a CalendarView over this
+    # window costs 33 s for +14d and 45 s for -7d/+14d. The backfill is
+    # what makes yesterday-inclusive queries cache-served, but every extra
+    # day is paid on EVERY refresh — two days covers the briefing case at
+    # a fraction of the cost.
+    ews_calendar_backfill_days: int = Field(default=2, ge=0, le=120)
     ews_calendar_max_items: int = Field(default=200, ge=1, le=1000)
     # A live CalendarView is far slower than any other read: observed 10-28 s
     # against a 30 s request_timeout, so near-misses failed outright. The
     # calendar lane gets its own, more generous deadline.
     ews_calendar_timeout_seconds: int = Field(default=90, ge=5, le=600)
+    # The calendar refresh is by far the most expensive thing this server
+    # asks Exchange for (45 s of server time, measured). Folders and tasks
+    # are cheap (4 s and 0 s) and may stay on the hierarchy clock; the
+    # calendar gets its own, much slower one so it stops competing with
+    # user reads for the mailbox's throttling budget.
+    ews_calendar_sync_seconds: int = Field(default=1800, ge=60, le=86400)
     ews_cache_hierarchy_seconds: int = 600
     ews_cache_window_days: int = 365
     ews_cache_purge_on_boot: bool = False  # admin path: wipe + resync from scratch

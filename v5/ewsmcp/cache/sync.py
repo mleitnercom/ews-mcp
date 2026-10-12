@@ -149,6 +149,7 @@ class SyncEngine:
         self._task: Optional[asyncio.Task] = None
         self._stopped = False
         self._last_slow_ts = 0.0
+        self._last_calendar_ts = 0.0
 
     # ------------------------------------------------------------ lifecycle
 
@@ -208,6 +209,31 @@ class SyncEngine:
         if time.time() - self._last_slow_ts >= slow_every:
             await self._gateway_call(self._sync_slow_lane)
             self._last_slow_ts = time.time()
+        # The calendar refresh runs on its own, much slower clock: measured
+        # at 45 s of Exchange time, it is the single most expensive thing
+        # this server asks for, and separate lanes do NOT protect user reads
+        # from it — both draw on the same mailbox throttling budget. On
+        # 2026-10-12 a user read inside a sync window took 23 s at Exchange
+        # with 0.1 s of local lock wait.
+        calendar_every = max(60, int(self.settings.ews_calendar_sync_seconds))
+        if time.time() - self._last_calendar_ts >= calendar_every:
+            if self._live_callers_waiting():
+                # Someone is waiting on Exchange right now. Yield the budget
+                # and try again next tick; a mirror minutes out of date beats
+                # a user call stalled behind our own refresh.
+                logger.info("calendar refresh deferred — live calls waiting")
+            else:
+                await self._gateway_call(self._sync_calendar_window)
+                self._last_calendar_ts = time.time()
+
+    def _live_callers_waiting(self) -> bool:
+        coordinator = self.coordinator
+        if coordinator is None or not hasattr(coordinator, "status"):
+            return False
+        try:
+            return int(coordinator.status().get("waiting_live_calls", 0)) > 0
+        except Exception:  # noqa: BLE001 — never let bookkeeping stop a sync
+            return False
 
     async def _gateway_call(self, fn: Any) -> Any:
         # Test gateways and older adapters only accept ``call(fn)``.
@@ -267,23 +293,17 @@ class SyncEngine:
                 except Exception as exc:
                     logger.warning("semantic indexing skipped this cycle: %s", exc)
 
-    def _sync_slow_lane(self, account: Any) -> None:
-        """Folder tree + expanded calendar window + tasks (every ~10 min)."""
-        tz = self.settings.ews_tz
-        # Folder tree with fresh counts — the frozen-counts fix.
-        try:
-            if hasattr(self.gateway, "prepare_folder_tree"):
-                self.gateway.prepare_folder_tree(account)
-            rows = collect_folder_rows(account)
-            self.store.replace_folders(rows)
-            self.store.set_sync_state("folders", None, time.time())
-        except Exception as exc:
-            logger.debug("folder tree sync failed: %s", exc)
 
-        # Expanded calendar occurrences for the overview window. The window
-        # reaches BACKWARDS as well: a briefing that includes yesterday, or a
-        # weekly review, would otherwise miss the mirror by definition and
-        # fall through to a live CalendarView.
+    def _sync_calendar_window(self, account: Any) -> None:
+        """Expand the mirrored CalendarView.
+
+        The window reaches BACKWARDS as well: a briefing that includes
+        yesterday, or a weekly review, would otherwise miss the mirror by
+        definition and fall through to a live CalendarView — which on this
+        Exchange costs 30-45 s. Every backfilled day is paid on every
+        refresh, which is why the default is small.
+        """
+        tz = self.settings.ews_tz
         try:
             now = datetime.now(ZoneInfo(tz))
             day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -291,6 +311,7 @@ class SyncEngine:
                 days=int(self.settings.ews_calendar_backfill_days))
             window_end = day_start + timedelta(
                 days=int(self.settings.ews_calendar_window_days))
+            started = time.time()
             events = list(account.calendar.view(
                 start=window_start,
                 end=window_end,
@@ -306,8 +327,25 @@ class SyncEngine:
             self.store.set_sync_state("events:end",
                                       str(int(window_end.timestamp())),
                                       time.time())
+            logger.info("calendar window refreshed: %d events in %.1fs",
+                        len(events), time.time() - started)
         except Exception as exc:
             logger.debug("calendar window sync failed: %s", exc)
+
+    def _sync_slow_lane(self, account: Any) -> None:
+        """Folder tree + tasks. The calendar moved to its own, slower
+        clock (_sync_calendar_window): at 45 s of Exchange time it was
+        ten times the cost of everything else here combined."""
+        tz = self.settings.ews_tz
+        # Folder tree with fresh counts — the frozen-counts fix.
+        try:
+            if hasattr(self.gateway, "prepare_folder_tree"):
+                self.gateway.prepare_folder_tree(account)
+            rows = collect_folder_rows(account)
+            self.store.replace_folders(rows)
+            self.store.set_sync_state("folders", None, time.time())
+        except Exception as exc:
+            logger.debug("folder tree sync failed: %s", exc)
 
         # Tasks folder (small; delta-synced like mail).
         try:

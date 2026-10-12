@@ -193,6 +193,9 @@ def test_slow_lane_syncs_folders_calendar_tasks(tmp_path):
 
     engine, store = _engine(tmp_path, account)
     engine._sync_slow_lane(account)
+    # The calendar moved to its own, slower clock: at 45 s of Exchange time
+    # it was starving user reads through the shared throttling budget.
+    engine._sync_calendar_window(account)
     folders = {r["path"]: r for r in store.folder_rows()}
     assert folders["Inbox"]["unread"] == 2
     assert store.watermark("folders") is not None

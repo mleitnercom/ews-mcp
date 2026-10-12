@@ -346,10 +346,7 @@ def test_calendar_mirror_window_reaches_backwards(tmp_path):
                               msg_folder_root=SimpleNamespace(walk=lambda: []))
     store = CacheStore(str(tmp_path / "mirror.db"))
     engine = SyncEngine(settings, gateway=None, store=store)
-    try:
-        engine._sync_slow_lane(account)
-    except Exception:
-        pass  # folders/tasks need more of the account; the calendar ran first
+    engine._sync_calendar_window(account)
     assert captured, "calendar view was never called"
     assert abs((captured["start"] - expected_start).total_seconds()) < 2
     assert abs((captured["end"] - expected_end).total_seconds()) < 2
