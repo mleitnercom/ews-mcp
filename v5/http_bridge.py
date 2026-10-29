@@ -85,7 +85,8 @@ def _setup_logging() -> None:
         os.makedirs(log_dir, exist_ok=True)
         fh = logging.FileHandler(
             os.path.join(log_dir,
-                         f"bridge-{datetime.now():%Y%m%d}-{os.getpid()}.log"),
+                         f"bridge-{datetime.now().astimezone():%Y%m%d}-"
+                         f"{os.getpid()}.log"),
             encoding="utf-8")
         fh.setFormatter(fmt)
         root.addHandler(fh)
@@ -274,8 +275,8 @@ class Upstream:
         try:
             await self.http.delete(self.url, headers=self._headers(),
                                    timeout=3)
-        except Exception:  # noqa: BLE001 — beim Beenden egal
-            pass
+        except Exception as exc:  # noqa: BLE001 — beim Beenden egal
+            logger.debug("session delete on close failed: %r", exc)
 
 
 async def main() -> None:

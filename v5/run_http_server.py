@@ -52,10 +52,11 @@ def _run_server() -> None:
 
     # pythonw.exe hat kein stdout/stderr; der StreamHandler in run_server.py
     # braucht aber einen Strom. Das Datei-Log unter DATA_DIR/logs bleibt.
+    # Kein with: die Stroeme muessen bis zum Prozessende offen bleiben.
     if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
     if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
 
     runpy.run_path(os.path.join(HERE, "run_server.py"), run_name="__main__")
 
