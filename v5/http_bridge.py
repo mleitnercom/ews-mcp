@@ -44,6 +44,8 @@ from mcp.types import JSONRPCMessage
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 RECONNECT_WAIT_S = 180
+# Answered from DATA_DIR/bridge-cache.json while the server is not up yet.
+CACHED_METHODS = ("initialize", "tools/list")
 SESSION_HEADER = "mcp-session-id"
 PROTOCOL_HEADER = "mcp-protocol-version"
 
@@ -111,16 +113,55 @@ def _is_response(obj: dict) -> bool:
 
 
 class Upstream:
-    def __init__(self, url: str, http: httpx.AsyncClient, to_client) -> None:
+    def __init__(self, url: str, http: httpx.AsyncClient, to_client,
+                 tg, cache_path: str) -> None:
         self.url = url
         self.http = http
         self.to_client = to_client
+        self.tg = tg
         self.session_id: str | None = None
         self.protocol: str | None = None
         self.init_msg: dict | None = None
         self.initialized_msg: dict | None = None
+        self.initialized_sent = False
+        self.connected = False
         self.generation = 0
         self.lock = anyio.Lock()
+        self.cache_path = cache_path
+        self.cache = self._load_cache()
+
+    def _load_cache(self) -> dict:
+        try:
+            with open(self.cache_path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {}
+
+    def _remember(self, method: str, result: dict) -> None:
+        if self.cache.get(method) == result:
+            return
+        self.cache[method] = result
+        tmp = f"{self.cache_path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.cache, fh)
+            os.replace(tmp, self.cache_path)  # several bridges write it
+        except OSError as exc:
+            logger.warning("cache not written (%s)", exc)
+
+    def _caching_sink(self, obj: dict):
+        """Deliver, and keep a cacheable result for the next cold start."""
+        method = obj.get("method")
+        cacheable = (method in CACHED_METHODS
+                     and not (obj.get("params") or {}).get("cursor"))
+
+        async def sink(msg: dict) -> None:
+            if (cacheable and _is_response(msg)
+                    and msg.get("id") == obj.get("id") and "result" in msg):
+                self._remember(method, msg["result"])
+            await self._deliver(msg)
+
+        return sink
 
     def _headers(self) -> dict:
         h = {"Accept": "application/json, text/event-stream",
@@ -196,6 +237,17 @@ class Upstream:
 
         await self._post(replay, swallow)
         if self.initialized_msg:
+            self.initialized_sent = True
+            await self._post(self.initialized_msg, self._deliver)
+
+    async def _connected_now(self, how: str) -> None:
+        self.connected = True
+        self.generation += 1
+        logger.info("%s (generation %d)", how, self.generation)
+        # notifications/initialized may have arrived while the handshake was
+        # already past the point where it sends it.
+        if self.initialized_msg and not self.initialized_sent:
+            self.initialized_sent = True
             await self._post(self.initialized_msg, self._deliver)
 
     async def reconnect(self, failed_generation: int) -> None:
@@ -206,8 +258,28 @@ class Upstream:
                 raise SessionLost()
             logger.warning("server gone or session unknown -- re-initializing")
             await self._wait_for(self._handshake, "reconnect")
-            self.generation += 1
-            logger.info("reconnected (generation %d)", self.generation)
+            await self._connected_now("reconnected")
+
+    async def _connect_in_background(self) -> None:
+        """After a cold start answered from the cache: wait for the server
+        as long as it takes. The lock is held per attempt only, so calls
+        arriving meanwhile still get their own 180s wait."""
+        delay = 1.0
+        while not self.connected:
+            async with self.lock:
+                if self.connected:
+                    return
+                try:
+                    await self._handshake()
+                    await self._connected_now("connected in background")
+                    return
+                except NOT_DELIVERED:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("background connect gave up: %r", exc)
+                    return
+            await anyio.sleep(delay)
+            delay = min(delay * 2, 10)
 
     async def _error(self, obj: dict, message: str) -> None:
         if _is_request(obj):
@@ -220,15 +292,32 @@ class Upstream:
 
         if method == "initialize":
             self.init_msg = obj
+            cached = self.cache.get("initialize")
+            caching = self._caching_sink(obj)
 
             async def sink(msg: dict) -> None:
                 if _is_response(msg) and msg.get("id") == obj.get("id"):
                     self._note_protocol(msg)
-                await self._deliver(msg)
+                await caching(msg)
 
             try:
-                await self._wait_for(lambda: self._post(obj, sink),
-                                     "initialize")
+                if cached:
+                    await self._post(obj, sink)
+                else:
+                    await self._wait_for(lambda: self._post(obj, sink),
+                                         "initialize")
+                await self._connected_now("connected")
+            except NOT_DELIVERED:
+                # The app gives up on a server that does not answer within
+                # a minute or two and keeps it failed until it is restarted.
+                # Answer from the last good start instead; the tool calls
+                # themselves wait for the server.
+                logger.warning("server not reachable at start -- answered "
+                               "initialize from cache, connecting in "
+                               "background")
+                await self._deliver({"jsonrpc": "2.0", "id": obj["id"],
+                                     "result": cached})
+                self.tg.start_soon(self._connect_in_background)
             except Exception as exc:  # noqa: BLE001
                 logger.error("initialize failed: %r", exc)
                 await self._error(obj, f"Exchange-Server nicht erreichbar: "
@@ -236,11 +325,20 @@ class Upstream:
             return
         if method == "notifications/initialized":
             self.initialized_msg = obj
+            if not self.connected:
+                return  # the background handshake sends it
+            self.initialized_sent = True
+        if (method in CACHED_METHODS and not self.connected
+                and method in self.cache
+                and not (obj.get("params") or {}).get("cursor")):
+            await self._deliver({"jsonrpc": "2.0", "id": obj["id"],
+                                 "result": self.cache[method]})
+            return
 
         for attempt in (1, 2):
             generation = self.generation
             try:
-                await self._post(obj, self._deliver)
+                await self._post(obj, self._caching_sink(obj))
                 return
             except NOT_DELIVERED as exc:
                 if attempt == 2:
@@ -293,9 +391,11 @@ async def main() -> None:
         timeout=httpx.Timeout(60, connect=10, read=900),
         follow_redirects=True,
     )
+    cache_path = os.path.join(
+        _setting("DATA_DIR", os.path.join(HERE, "data")), "bridge-cache.json")
     async with http, stdio_server() as (stdin, stdout):
-        upstream = Upstream(url, http, stdout)
         async with anyio.create_task_group() as tg:
+            upstream = Upstream(url, http, stdout, tg, cache_path)
             async for msg in stdin:
                 if isinstance(msg, Exception):
                     logger.warning("client: %s", msg)
